@@ -39,6 +39,8 @@ static void* (*real_calloc)(size_t, size_t) = NULL;
 static void* (*real_mmap)(void*, size_t, int, int, int, off_t) = NULL;
 static int   (*real_munmap)(void*, size_t) = NULL;
 
+double start_time = 0.0;
+double end_time = 0.0;
 
 static double get_timestamp() {
     struct timespec ts;
@@ -74,6 +76,9 @@ static void __attribute__((destructor)) output_final_stats() {
     }
     memory_list = NULL;
     if (log_file) {
+        end_time = get_timestamp();
+        fprintf(log_file,"start_time: %.6f, end_time: %.6f", start_time, end_time);
+        fflush(log_file);
         in_hook = true;
         fclose(log_file);//free的时候可能导致死锁
         log_file = NULL;
@@ -154,6 +159,7 @@ static void init_hooks_once() {
     if (!real_malloc || !real_free || !real_calloc || !real_mmap || !real_munmap) {
         exit(1);
     }
+    start_time = get_timestamp();
     open_log_file();
 }
 

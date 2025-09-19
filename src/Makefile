@@ -8,7 +8,7 @@ LDFLAGS = -shared
 LIB_DIR = ../lib
 all: libMallocHook.so
 
-libMallocHook.so: c/malloc_hook.c
+libMallocHook.so: malloc_hook.c
 	mkdir -p $(LIB_DIR)
 	$(CC) $(CFLAGS) -o $(LIB_DIR)/$@ $< $(LDFLAGS)
 
