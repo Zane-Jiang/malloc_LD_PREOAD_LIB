@@ -1,0 +1,1 @@
+malloc_hook.o: malloc_hook.c

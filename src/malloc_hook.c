@@ -12,13 +12,26 @@
 #include <float.h>
 #include <sys/mman.h>
 
+
+#ifdef __x86_64__
+#define rdtscll(val) { \
+    unsigned int __a,__d;                                        \
+    asm volatile("rdtsc" : "=a" (__a), "=d" (__d));              \
+    (val) = ((unsigned long)__a) | (((unsigned long)__d)<<32);   \
+}
+
+#else
+#define rdtscll(val) __asm__ __volatile__("rdtsc" : "=A" (val))
+#endif
+
+
 typedef struct MemoryBlock {
     void* ptr;
     uint64_t size;
     uint64_t id;
     char location[64];
-    double alloc_ts;
-    double free_ts;
+    uint64_t alloc_ts;
+    uint64_t free_ts;
 } MemoryBlock;
 
 typedef struct MemNode {
@@ -42,11 +55,6 @@ static int   (*real_munmap)(void*, size_t) = NULL;
 double start_time = 0.0;
 double end_time = 0.0;
 
-static double get_timestamp() {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts.tv_sec + ts.tv_nsec / 1e9;
-}
 
 static void open_log_file() {
     const char* prof_env = getenv("HEAP_PROF_PATH");
@@ -65,7 +73,7 @@ static void __attribute__((destructor)) output_final_stats() {
     while (curr) {
         MemoryBlock* block = &curr->block;
         if (log_file) {
-            fprintf(log_file, "%-10" PRIu64 " %14p %10s %-10" PRIu64 " %.6f %.6f\n",
+            fprintf(log_file, "%-10" PRIu64 " %14p %10s %-10" PRIu64 " %lu %lu\n",
                     block->id, block->ptr, block->location, block->size,
                     block->alloc_ts, block->free_ts);
         }
@@ -76,8 +84,7 @@ static void __attribute__((destructor)) output_final_stats() {
     }
     memory_list = NULL;
     if (log_file) {
-        end_time = get_timestamp();
-        fprintf(log_file,"start_time: %.6f, end_time: %.6f", start_time, end_time);
+        rdtscll(end_time);
         fflush(log_file);
         in_hook = true;
         fclose(log_file);//free的时候可能导致死锁
@@ -104,8 +111,8 @@ static void register_alloc(void* ptr, size_t size, const char* location) {
     node->block.id = global_id++;
     strncpy(node->block.location, location ? location : "unknown", sizeof(node->block.location) - 1);
     node->block.location[sizeof(node->block.location) - 1] = '\0';
-    node->block.alloc_ts = get_timestamp();
-    node->block.free_ts = DBL_MAX ; 
+    rdtscll(node->block.alloc_ts);
+    node->block.free_ts = UINT64_MAX ; 
 
     pthread_mutex_lock(&mtx);
     node->next = memory_list;
@@ -126,10 +133,9 @@ static void unregister_alloc(void* ptr) {
     while (*curr) {
         if ((*curr)->addr == (uintptr_t)ptr) {
             MemoryBlock* block = &(*curr)->block;
-            block->free_ts = get_timestamp();
-
+            rdtscll(block->free_ts);
             if (log_file) {
-                fprintf(log_file, "%-10" PRIu64 " %14p %10s %-10" PRIu64 " %.6f %.6f\n",
+                fprintf(log_file, "%-10" PRIu64 " %14p %10s %-10" PRIu64 " %lu %lu\n",
                         block->id, block->ptr, block->location, block->size,
                         block->alloc_ts, block->free_ts);
                 fflush(log_file);
@@ -159,7 +165,7 @@ static void init_hooks_once() {
     if (!real_malloc || !real_free || !real_calloc || !real_mmap || !real_munmap) {
         exit(1);
     }
-    start_time = get_timestamp();
+    rdtscll(start_time);
     open_log_file();
 }
 

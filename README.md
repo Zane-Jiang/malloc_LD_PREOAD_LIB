@@ -14,3 +14,6 @@ Currently suport C++ \Fortran and C lang.
 #### Usage of LD_PRELOAD environment variable:
     export LD_PRELOAD=$LD_PRELOAD:$(pwd)/lib/libMallocHook.so
 
+### sora
+  `sora` dir copy from sora, has greater perfomance in mult-thread environment than mine。
+
