@@ -16,6 +16,21 @@
 #include <new>
 #include <sys/types.h>
 #include <numa.h>
+#include <ctype.h>
+#include <sched.h>
+#include <errno.h>
+#include <numaif.h>
+
+
+#define NUMA_DEFAULT_NODE (-1)
+#define NUMA_LOCAL_NODE 0
+#define NUMA_CXL_NODE 2          /* Node to allocate CXL memory */
+#define CXL_MALLOC_ENABLE_LOG 
+#ifdef CXL_MALLOC_ENABLE_LOG
+#define CXL_LOG(fmt, ...) printf("[cxl_malloc] " fmt "\n", ##__VA_ARGS__)
+#else
+#define CXL_LOG(...) ((void)0)
+#endif
 
 #define ARR_SIZE 550000            /* Max number of malloc per core */
 #define MAX_TID 512                /* Max number of tids to profile */
@@ -28,7 +43,7 @@
 #define IGNORE_FIRST_PROCESS 0     /* Ignore the first process (and all its threads). Useful for processes */
 
 #define MAX_OBJECTS          30000
-#define CXL_MALLOC_NODE 2          /* Node to allocate CXL memory */
+
 
 
 #if IGNORE_FIRST_PROCESS
@@ -41,7 +56,8 @@ static int __thread nb_allocs = 0;
 #define MAX_LINES 1000
 #define MAX_NAME_LENGTH 20
 char *obj_names[MAX_LINES];
-
+size_t obj_retain[MAX_LINES];
+const uint64_t SYS_RETAIN_CAPACITY = 100 * 1024 *1024; // systerm retain capacity
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static int __thread pid;
 static int __thread tid;
@@ -135,7 +151,6 @@ struct log *get_log()
         return NULL;
 
     struct log *l = &log_arr[tid_index][log_index[tid_index]];
-    /* printf("%d %d \n", tid_index, (int)log_index[tid_index]); */
     log_index[tid_index]++;
     return l;
 }
@@ -158,44 +173,74 @@ int get_trace(size_t *size, void **strings)
             break;
     }
 #else
-    *size = backtrace(strings, 10);
+    int depth = backtrace(strings, CALLCHAIN_SIZE);
+    if (depth < 0)
+        depth = 0;
+    *size = (size_t)depth;
 #endif
     _in_trace = 0;
     return 0;
 }
 
-int _getpid()
+static long long get_node_free_bytes(int node)
 {
-    if (pid)
-        return pid;
-    return pid = getpid();
+    long long free_bytes = 0;
+    if (numa_node_size64(node, &free_bytes) < 0)
+        return -1;
+    return free_bytes;
 }
 
-int check_trace(void *string, size_t sz)
+int get_numa_node(void *string, size_t sz)
 {
-    int ret = -1;
-    char *ptr = (char *) string;        
-    int start = 0;
-    int k1 = obj_count * 85/100;
-    for (int i = start; i < k1; i += 1) {
-        if (strstr(ptr, obj_names[i]) != NULL) {
-            ret =  0;
+    return NUMA_CXL_NODE;
+    const char *symbol = (const char *)string;
+    const char *start = strrchr(symbol, '[');
+    const char *end = strrchr(symbol, ']');
+    if (!start || !end || end <= start + 1) {
+        start = symbol;
+        end = symbol + strlen(symbol);
+    } else {
+        start++;
+    }
+    while (start < end && isspace((unsigned char)*start)) start++;
+    while (end > start && isspace((unsigned char)*(end - 1))) end--;
+    size_t addr_len = (size_t)(end - start);
+    if (addr_len >= MAX_NAME_LENGTH) addr_len = MAX_NAME_LENGTH - 1;
+
+    char addr_buf[MAX_NAME_LENGTH];
+    memcpy(addr_buf, start, addr_len);
+    addr_buf[addr_len] = '\0';
+
+    if (addr_buf[0] == '\0') {
+        return NUMA_DEFAULT_NODE;
+    }
+    for (int i = 0; i < obj_count; i++) {
+        if (strcmp(addr_buf, obj_names[i]) == 0) {
+            if (numa_available() < 0)
+                return NUMA_DEFAULT_NODE;
+            // static int local_node = -2;
+            // if (local_node == -2) {
+            //     int cpu = sched_getcpu();
+            //     local_node = cpu >= 0 ? numa_node_of_cpu(cpu) : -1;
+            //     if (local_node < 0)
+            //         local_node = numa_preferred();
+            //     if (local_node < 0)
+            //         local_node = 0;
+            // }
+            static int local_node = NUMA_LOCAL_NODE;
+            long long local_free = get_node_free_bytes(local_node);
+            if (local_free < 0)
+                return NUMA_DEFAULT_NODE;
+            long long available = local_free - (long long)obj_retain[i] - SYS_RETAIN_CAPACITY;
+            if (available > (long long)sz)
+                return NUMA_DEFAULT_NODE;
+
+            long long cxl_free = get_node_free_bytes(NUMA_CXL_NODE);
+            if (cxl_free > (long long)sz)
+                return NUMA_CXL_NODE;
         }
     }
-    int k2 = obj_count * 9/10;
-    for (int i = k1; i < k2; i += 1) {
-        if (strstr(ptr, obj_names[i]) != NULL) {
-            ret =  -1;
-        }
-    }
-    int end = obj_count;
-    for (int i = k2; i < end; i += 1) {
-        if (strstr(ptr, obj_names[i]) != NULL) {
-            ret = CXL_MALLOC_NODE;
-        }
-    }
-    
-    return -1;
+    return NUMA_DEFAULT_NODE;
 }
 
 void record_seg(unsigned long addr, size_t size)
@@ -232,6 +277,32 @@ size_t check_seg(unsigned long addr)
     return size_to_free;
 }
 
+
+static inline int prefer_node(int nid) {
+    unsigned long nodemask = 1UL << nid;
+    int maxnode = sizeof(nodemask) * 8;
+    return set_mempolicy(MPOL_PREFERRED, &nodemask, maxnode);
+}
+
+static inline int reset_mempolicy() {
+    return set_mempolicy(MPOL_DEFAULT, NULL, 0);
+}
+void *alloc_on_node(size_t sz,int node){
+    void *p = NULL;
+    if(node == NUMA_DEFAULT_NODE){
+        p = libc_malloc(sz);  
+        return p;
+    }
+    if (prefer_node(node) != 0) {
+        perror("prefer_node(0) failed");
+        return libc_malloc(sz);
+    }
+    p = libc_malloc(sz);  
+    reset_mempolicy();
+    return p;
+}
+
+
 extern "C" void *malloc(size_t sz)
 {
     if (!libc_malloc)
@@ -249,15 +320,16 @@ extern "C" void *malloc(size_t sz)
     }
     if (sz > 4096 && !_in_trace && log_arr) {
         if (log_arr->callchain_size >= 4) {
-            char **strings = backtrace_symbols (log_arr->callchain_strings, log_arr->callchain_size);
-            int ret = check_trace(strings[3], sz);
-            libc_free(strings);
-            if (ret > -1) {
-                addr = numa_alloc_onnode(sz, ret);
-                record_seg((unsigned long)addr, sz);
+            char **strings = backtrace_symbols(log_arr->callchain_strings, log_arr->callchain_size);
+            if (strings) {
+                int numa_node = get_numa_node(strings[3], sz);
+                libc_free(strings);
+                addr = alloc_on_node(sz, numa_node);
             } else {
                 addr = libc_malloc(sz);
             }
+            if (log_arr)
+                log_arr->addr = addr;
         } else {
             addr = libc_malloc(sz);
         }
@@ -339,6 +411,11 @@ extern "C" int posix_memalign(void **ptr, size_t align, size_t sz)
 
 extern "C" void free(void *p)
 {
+    if (!libc_free)
+        m_init();
+    if (!libc_free)
+        return;
+
     if (!_in_trace && libc_free) {
         size_t size_to_free = check_seg((unsigned long) p);
         if (size_to_free > 0) {
@@ -348,7 +425,7 @@ extern "C" void free(void *p)
             libc_free(p);
             return;
         }
-    } else {
+    } else if (libc_free) {
         libc_free(p);
     }
     /* libc_free(p); */
@@ -446,42 +523,42 @@ int read_score(){
 
     const char *filename = getenv("CXL_MALLOC_OBJ_RANK_RESULT");
     if (!filename) {
-        printf("Environment variable CXL_MALLOC_OBJ_RANK_RESULT not set.\n");
+        printf("Environment variable CXL_MALLOC_OBJ_RANK_RESULT not set.");
         return 1;
     }
     file = fopen(filename, "r");
     if (file == NULL) {
-        printf("Can not open file: %s\n", filename);
+        printf("Can not open file: %s", filename);
         return 1;
     }
     
 
     while (fgets(line, sizeof(line), file) != NULL && obj_count < MAX_LINES) {
-        char *token;
-        int column = 0;
-        char obj_name[MAX_NAME_LENGTH];
-        
-
-        token = strtok(line, ",");
-        
-        while (token != NULL && column < 5) { 
-            if (column == 1) { 
-                if (strncmp(token, "0x", 2) == 0) {
-                    strncpy(obj_name, token + 2, MAX_NAME_LENGTH - 1);
-                } else {
-                    strncpy(obj_name, token, MAX_NAME_LENGTH - 1);
-                }
-                obj_name[MAX_NAME_LENGTH - 1] = '\0'; 
-                
-                obj_names[obj_count] = (char*)libc_malloc(strlen(obj_name) + 1);
-                strcpy(obj_names[obj_count], obj_name);
-            }
-            token = strtok(NULL, ",");
-            column++;
+        char *cursor = line;
+        size_t len = strcspn(cursor, "\r\n");
+        cursor[len] = '\0';
+        while (*cursor && isspace((unsigned char)*cursor)) {
+            cursor++;
         }
+        if (*cursor == '\0') {
+            continue;
+        }
+        char *comma = strchr(cursor, ',');
+        if (!comma)
+            continue;
+        *comma = '\0';
+        char *retain_str = comma + 1;
+        while (*retain_str && isspace((unsigned char)*retain_str))
+            retain_str++;
+        size_t copy_len = strlen(cursor);
+        if (copy_len >= MAX_NAME_LENGTH)
+            copy_len = MAX_NAME_LENGTH - 1;
+        obj_names[obj_count] = (char*)libc_malloc(copy_len + 1);
+        strncpy(obj_names[obj_count], cursor, copy_len);
+        obj_names[obj_count][copy_len] = '\0';
+        obj_retain[obj_count] = (size_t)strtoull(retain_str, NULL, 10);
         obj_count++;
     }
-    
     fclose(file);
     return 0;
 }

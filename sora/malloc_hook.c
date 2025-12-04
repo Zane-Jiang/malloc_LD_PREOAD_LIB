@@ -49,6 +49,7 @@ struct log {
 
     size_t callchain_size;
     void *callchain_strings[CALLCHAIN_SIZE];
+    unsigned long callchain_offsets[CALLCHAIN_SIZE];  // Add offsets for addr2line
 };
 struct log *log_arr[MAX_TID];
 static size_t log_index[MAX_TID];
@@ -171,6 +172,16 @@ int _getpid()
     return pid = getpid();
 }
 
+// Helper function to get symbol offset from ELF binary
+static unsigned long get_symbol_offset(void *addr)
+{
+    Dl_info info;
+    if (dladdr(addr, &info) && info.dli_fbase) {
+        return (unsigned long)addr - (unsigned long)info.dli_fbase;
+    }
+    return (unsigned long)addr;
+}
+
 extern "C" void *malloc(size_t sz)
 {
     if (!libc_malloc)
@@ -186,6 +197,11 @@ extern "C" void *malloc(size_t sz)
             log_arr->size = sz;
             log_arr->entry_type = 1;
             get_trace(&log_arr->callchain_size, log_arr->callchain_strings);
+            
+            // Store offsets for addr2line
+            for (size_t i = 0; i < log_arr->callchain_size; i++) {
+                log_arr->callchain_offsets[i] = get_symbol_offset(log_arr->callchain_strings[i]);
+            }
         }
     }
     return addr;
@@ -367,22 +383,26 @@ void __attribute__((destructor)) bye(void)
         FILE *file = open_file(tids[i]);
         for (j = 0; j < log_index[i]; j++) {
             struct log *l = &log_arr[i][j];
-            #if RESOLVE_SYMBS
             _in_trace = 1;
-            char **strings = backtrace_symbols (l->callchain_strings, l->callchain_size);
+            char **strings = backtrace_symbols(l->callchain_strings, l->callchain_size);
             if (l->callchain_size >= 4) {
+                fprintf(file, "%s ", strings[3]);
+                fprintf(file, "%lu %lu %lx %d ", l->rdt, (long unsigned)l->size, 
+                (long unsigned)l->addr, (int)l->entry_type);
 
-                fprintf (file, "%s+%s+%s+%s ", strings[3], strings[2], strings[1], strings[0]);
-                // printf("[prof] treace  string: %s\n", (char*)(strings[3]));
+                Dl_info info;
+                // Try to get binary name and offset for addr2line
+                if (dladdr(l->callchain_strings[3], &info) && info.dli_fname) {
+                    fprintf(file, "%s:0x%lx \n", info.dli_fname, 
+                            (unsigned long)l->callchain_strings[3] - (unsigned long)info.dli_fbase);
+                }
+            }else {
+                fprintf(file, "unknown ");
+                fprintf(file, "%lu %lu %lx %d\n", l->rdt, (long unsigned)l->size, 
+                (long unsigned)l->addr, (int)l->entry_type);
             }
-
             libc_free(strings);
-            #else
-            if (l->callchain_size >= 4) {
-                fprintf (file, "[%p] ", l->callchain_strings[3]);
-            }
-            #endif
-            fprintf(file, "%lu %lu %lx %d\n", l->rdt, (long unsigned)l->size, (long unsigned)l->addr, (int)l->entry_type);
+
         }
         fclose(file);
     }
