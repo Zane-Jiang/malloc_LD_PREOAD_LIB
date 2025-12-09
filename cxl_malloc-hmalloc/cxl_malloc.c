@@ -3,9 +3,6 @@
 #endif
 #define __USE_GNU
 
-
-
-
 #include "env.h"
 #include <jemalloc/jemalloc.h>
 #include <stdbool.h>
@@ -60,7 +57,7 @@
 static char *obj_names[MAX_LINES];
 static size_t obj_retain[MAX_LINES];
 static int obj_count = 0;
-const uint64_t SYS_RETAIN_CAPACITY = 1000 * 1024 *1024; // systerm retain capacity
+static size_t total_retain_capacity = 0; // systerm retain capacity
 
 
 struct addr_seg {
@@ -145,70 +142,21 @@ int get_trace(size_t *size, void **strings)
     return 0;
 }
 
-static long long get_node_free_bytes(int node)
+// More accurate memory check considering lazy allocation
+static long long get_node_available_bytes(int node, int exclude_node __unused)
 {
     long long free_bytes = 0;
-    if (numa_node_size64(node, &free_bytes) < 0)
+    long long total_bytes = numa_node_size64(node, &free_bytes);
+    if (total_bytes < 0)
         return -1;
-    return free_bytes;
-}
 
-// Get physically allocated memory for a NUMA node from /proc/numa_maps
-static long long get_node_physical_used_bytes(int node)
-{
-    FILE *fp;
-    char line[256];
-    long long used_bytes = 0;
-    
-    fp = fopen("/proc/self/numa_maps", "r");
-    if (!fp)
-        return -1;
-    
-    while (fgets(line, sizeof(line), fp)) {
-        unsigned long addr;
-        int pages_node;
-        char heap_stack[32];
-        
-        if (sscanf(line, "%lx prefer:%d %31s N=%*d %*d", &addr, &pages_node, heap_stack) == 3) {
-            if (pages_node == node) {
-                // Count pages on this node
-                char *p = strchr(line, 'N');
-                if (p) {
-                    int node_id, pages_count;
-                    if (sscanf(p, "N=%d %d", &node_id, &pages_count) == 2 && node_id == node) {
-                        used_bytes += (long long)pages_count * 4096;  // 4KB pages
-                    }
-                }
-            }
-        }
-    }
-    fclose(fp);
-    return used_bytes;
-}
+    if (free_bytes < 0)
+        free_bytes = 0;
 
-// More accurate memory check considering lazy allocation
-static long long get_node_available_bytes(int node, int exclude_node)
-{
-    long long total_bytes = 0;
-    long long used_bytes = 0;
-    
-    // Get total node memory
-    if (numa_node_size64(node, &total_bytes) < 0)
-        return -1;
-    
-    // Get physically allocated memory on this node
-    used_bytes = get_node_physical_used_bytes(node);
-    if (used_bytes < 0)
-        used_bytes = 0;
-    
-    long long available = total_bytes - used_bytes;
-    
-    // Add extra safety margin to account for:
-    // 1. Memory that will be allocated but not yet paged
-    // 2. System memory needed for page tables and metadata
-    long long safety_margin = MIN_SAFE_FREE_MEMORY + (total_bytes / 20);  // 5% extra buffer
-    
-    return available - safety_margin;
+    long long safety_margin = MIN_SAFE_FREE_MEMORY + (total_bytes / 20);
+    long long available = free_bytes - safety_margin;
+
+    return available > 0 ? available : 0;
 }
 
 
@@ -258,7 +206,6 @@ int get_numa_node(void *string, size_t sz)
                 return NUMA_DEFAULT_NODE;
             
             if (cxl_available > (long long)sz) {
-                CXL_LOG("Allocating %zu bytes to CXL node (available: %lld)", sz, cxl_available);
                 return NUMA_CXL_NODE;
             }
             
@@ -269,6 +216,105 @@ int get_numa_node(void *string, size_t sz)
         }
     }
     return NUMA_DEFAULT_NODE;
+}
+
+int get_numa_node_v2(void *string, size_t sz)
+{
+    if (numa_available() < 0 || obj_count == 0)
+        return NUMA_DEFAULT_NODE;
+
+    const char *symbol = (const char *)string;
+    const char *start = strrchr(symbol, '[');
+    const char *end = strrchr(symbol, ']');
+    if (!start || !end || end <= start + 1) {
+        start = symbol;
+        end = symbol + strlen(symbol);
+    } else {
+        start++;
+    }
+    while (start < end && isspace((unsigned char)*start)) start++;
+    while (end > start && isspace((unsigned char)*(end - 1))) end--;
+    size_t addr_len = (size_t)(end - start);
+    if (addr_len >= MAX_NAME_LENGTH) addr_len = MAX_NAME_LENGTH - 1;
+
+    char addr_buf[MAX_NAME_LENGTH];
+    memcpy(addr_buf, start, addr_len);
+    addr_buf[addr_len] = '\0';
+
+    if (addr_buf[0] == '\0')
+        return NUMA_DEFAULT_NODE;
+
+    size_t front_limit = (obj_count + 4) / 5;
+    size_t back_start = obj_count > front_limit ? obj_count - front_limit : 0;
+
+    for (int i = 0; i < obj_count; ++i) {
+        if (strcmp(addr_buf, obj_names[i]) == 0) {
+            if ((size_t)i < front_limit)
+                return NUMA_LOCAL_NODE;
+            if ((size_t)i >= back_start)
+                return NUMA_CXL_NODE;
+            break;
+        }
+    }
+    return get_numa_node(string, sz);
+}
+
+int get_numa_node_v3(void *string, size_t sz)
+{
+    if (numa_available() < 0 || obj_count == 0 || total_retain_capacity == 0)
+        return NUMA_DEFAULT_NODE;
+
+    const char *symbol = (const char *)string;
+    const char *start = strrchr(symbol, '[');
+    const char *end = strrchr(symbol, ']');
+    if (!start || !end || end <= start + 1) {
+        start = symbol;
+        end = symbol + strlen(symbol);
+    } else {
+        start++;
+    }
+    while (start < end && isspace((unsigned char)*start)) start++;
+    while (end > start && isspace((unsigned char)*(end - 1))) end--;
+    size_t addr_len = (size_t)(end - start);
+    if (addr_len >= MAX_NAME_LENGTH) addr_len = MAX_NAME_LENGTH - 1;
+
+    char addr_buf[MAX_NAME_LENGTH];
+    memcpy(addr_buf, start, addr_len);
+    addr_buf[addr_len] = '\0';
+
+    if (addr_buf[0] == '\0')
+        return NUMA_DEFAULT_NODE;
+
+    size_t quota = (total_retain_capacity + 4) / 5;
+    size_t cumulative = 0;
+    int matched_idx = -1;
+
+    for (int i = 0; i < obj_count; ++i) {
+        size_t prev = cumulative;
+        cumulative += obj_retain[i];
+        if (strcmp(addr_buf, obj_names[i]) == 0) {
+            matched_idx = i;
+            if (prev < quota)
+                return NUMA_LOCAL_NODE;
+            break;
+        }
+    }
+
+    if (matched_idx == -1)
+        return get_numa_node(string, sz);
+
+    size_t suffix = 0;
+    for (int i = obj_count - 1; i >= 0; --i) {
+        size_t prev = suffix;
+        suffix += obj_retain[i];
+        if (i == matched_idx) {
+            if (prev < quota)
+                return NUMA_CXL_NODE;
+            break;
+        }
+    }
+
+    return get_numa_node(string, sz);
 }
 
 
@@ -366,17 +412,55 @@ void *malloc(size_t sz)
 
 void *calloc(size_t nmemb, size_t size)
 {
-    void *addr;
     if (!libc_calloc) {
-        memset(empty_data, 0, sizeof(*empty_data));
-        addr = empty_data;
+        m_init();
+    }
+    if (!libc_calloc)
+        return NULL;
+
+    if (size != 0 && nmemb > SIZE_MAX / size) {
+        errno = ENOMEM;
+        return NULL;
+    }
+
+    size_t total = nmemb * size;
+    void *addr = NULL;
+    size_t callchain_size_local = 0;
+    void *callchain_strings_local[CALLCHAIN_SIZE];
+
+    if (!_in_trace) {
+        get_trace(&callchain_size_local, callchain_strings_local);
+    }
+
+    if (total > 4096 && !_in_trace) {
+        if (callchain_size_local >= 4) {
+            char **strings = backtrace_symbols(callchain_strings_local, (int)callchain_size_local);
+            if (strings) {
+                int numa_node = get_numa_node(strings[3], total);
+                libc_free(strings);
+                if (NUMA_CXL_NODE == numa_node) {
+                    addr = hcalloc(nmemb, size);
+                    if (addr && total > 0) {
+                        record_seg((unsigned long)addr, total);
+                    } else if (!addr) {
+                        CXL_LOG("hcalloc failed for nmemb %zu, size %zu, falling back to libc_calloc", nmemb, size);
+                        addr = libc_calloc(nmemb, size);
+                    }
+                } else {
+                    addr = libc_calloc(nmemb, size);
+                }
+            } else {
+                addr = libc_calloc(nmemb, size);
+            }
+        } else {
+            addr = libc_calloc(nmemb, size);
+        }
     } else {
         addr = libc_calloc(nmemb, size);
     }
-    if (!_in_trace && libc_calloc) {
-        size_t callchain_size_local = 0;
-        void *callchain_strings_local[CALLCHAIN_SIZE];
-        get_trace(&callchain_size_local, callchain_strings_local);
+
+    if (!addr) {
+        CXL_LOG("calloc failed for nmemb %zu, size %zu", nmemb, size);
     }
     return addr;
 }
@@ -526,7 +610,6 @@ __attribute__((constructor)) void hmalloc_init(void) {
 
 void __attribute__((constructor)) m_init(void)
 {
-
     libc_malloc = (void * ( *)(size_t))dlsym(RTLD_NEXT, "malloc");
     libc_realloc = (void * ( *)(void *, size_t))dlsym(RTLD_NEXT, "realloc");
     libc_calloc = (void * ( *)(size_t, size_t))dlsym(RTLD_NEXT, "calloc");
@@ -577,6 +660,7 @@ void __attribute__((constructor)) m_init(void)
         strncpy(obj_names[obj_count], cursor, copy_len);
         obj_names[obj_count][copy_len] = '\0';
         obj_retain[obj_count] = (size_t)strtoull(retain_str, NULL, 10);
+        total_retain_capacity = obj_retain[obj_count];
         obj_count++;
     }
     fclose(file);
