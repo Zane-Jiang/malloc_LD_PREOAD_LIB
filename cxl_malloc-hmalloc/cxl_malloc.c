@@ -120,24 +120,10 @@ int get_trace(size_t *size, void **strings)
     if (_in_trace)
         return 1;
     _in_trace = 1;
-
-#if USE_FRAME_POINTER
-    int i;
-    struct stack_frame *frame;
-    get_bp(frame);
-    for (i = 0; i < CALLCHAIN_SIZE; i++) {
-        strings[i] = (void*)frame->return_address;
-        *size = i + 1;
-        frame = frame->next_frame;
-        if (!frame)
-            break;
-    }
-#else
     int depth = backtrace(strings, CALLCHAIN_SIZE);
     if (depth < 0)
         depth = 0;
     *size = (size_t)depth;
-#endif
     _in_trace = 0;
     return 0;
 }

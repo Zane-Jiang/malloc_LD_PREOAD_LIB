@@ -63,7 +63,7 @@ void *interweave_calloc(size_t nmemb, size_t size);
 void *interweave_realloc(void *ptr, size_t size);
 void *interweave_aligned_alloc(size_t alignment, size_t size);
 int interweave_posix_memalign(void **memptr, size_t alignment, size_t sz);
-// size_t interweave_malloc_usable_size(void *ptr);
+
 
 
 static void *(*libc_malloc)(size_t) = NULL;
