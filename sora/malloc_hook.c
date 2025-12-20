@@ -22,7 +22,7 @@
 #define MAX_TID 512                /* Max number of tids to profile */
 
 #define USE_FRAME_POINTER   0      /* Use Frame Pointers to compute the stack trace (faster) */
-#define CALLCHAIN_SIZE      5      /* stack trace length */
+#define CALLCHAIN_SIZE      10     /* stack trace length - 增大以区分更深的调用路径 */
 #define RESOLVE_SYMBS       1      /* Resolve symbols at the end of the execution; quite costly */
 
 #define NB_ALLOC_TO_IGNORE   0     /* Ignore the first X allocations. */
@@ -50,6 +50,7 @@ struct log {
     size_t callchain_size;
     void *callchain_strings[CALLCHAIN_SIZE];
     unsigned long callchain_offsets[CALLCHAIN_SIZE];  // Add offsets for addr2line
+    uint64_t callstack_hash;                     // Deterministic hash of the call stack
 };
 struct log *log_arr[MAX_TID];
 static size_t log_index[MAX_TID];
@@ -141,36 +142,50 @@ struct log *get_log()
     return l;
 }
 
+//  (FNV-1a)
+static uint64_t fnv1a_hash(const unsigned char *data, size_t len)
+{
+    uint64_t hash = 14695981039346656037ULL; // FNV offset basis
+    for (size_t i = 0; i < len; i++) {
+        hash ^= data[i];
+        hash *= 1099511628211ULL; // FNV prime
+    }
+    return hash;
+}
+
+static uint64_t compute_callstack_hash(void **callchain, size_t size)
+{
+    unsigned long offsets[CALLCHAIN_SIZE];
+    Dl_info info;
+    size_t offset_count = 0;
+    
+    for (size_t i = 0; i < size && i < CALLCHAIN_SIZE; i++) {
+        if (dladdr(callchain[i], &info) && info.dli_fbase) {
+            // Skip shared library frames (only hash main program frames)
+            if (info.dli_fname && strstr(info.dli_fname, ".so")) {
+                continue;
+            }
+            offsets[offset_count++] = (unsigned long)callchain[i] - (unsigned long)info.dli_fbase;
+        }
+    }
+    
+    if (offset_count == 0) {
+        return 0;
+    }
+    
+    return fnv1a_hash((const unsigned char *)offsets, offset_count * sizeof(unsigned long));
+}
+
 int get_trace(size_t *size, void **strings)
 {
     if (_in_trace)
         return 1;
     _in_trace = 1;
-
-#if USE_FRAME_POINTER
-    int i;
-    struct stack_frame *frame;
-    get_bp(frame);
-    for (i = 0; i < CALLCHAIN_SIZE; i++) {
-        strings[i] = (void*)frame->return_address;
-        *size = i + 1;
-        frame = frame->next_frame;
-        if (!frame)
-            break;
-    }
-#else
-    *size = backtrace(strings, 10);
-#endif
+    *size = backtrace(strings, CALLCHAIN_SIZE);
     _in_trace = 0;
     return 0;
 }
 
-int _getpid()
-{
-    if (pid)
-        return pid;
-    return pid = getpid();
-}
 
 // Helper function to get symbol offset from ELF binary
 static unsigned long get_symbol_offset(void *addr)
@@ -197,12 +212,12 @@ extern "C" void *malloc(size_t sz)
             log_arr->size = sz;
             log_arr->entry_type = 1;
             get_trace(&log_arr->callchain_size, log_arr->callchain_strings);
-            
+            log_arr->callstack_hash = compute_callstack_hash(log_arr->callchain_strings, log_arr->callchain_size);
+
             // Store offsets for addr2line
             for (size_t i = 0; i < log_arr->callchain_size; i++) {
                 log_arr->callchain_offsets[i] = get_symbol_offset(log_arr->callchain_strings[i]);
-            }
-        }
+            }        }
     }
     return addr;
 }
@@ -224,6 +239,7 @@ extern "C" void *calloc(size_t nmemb, size_t size)
             log_arr->size = nmemb * size;
             log_arr->entry_type = 3;
             get_trace(&log_arr->callchain_size, log_arr->callchain_strings);
+            log_arr->callstack_hash = compute_callstack_hash(log_arr->callchain_strings, log_arr->callchain_size);
         }
     }
     return addr;
@@ -240,6 +256,7 @@ extern "C" void *realloc(void *ptr, size_t size)
             log_arr->size = size;
             log_arr->entry_type = 4;
             get_trace(&log_arr->callchain_size, log_arr->callchain_strings);
+            log_arr->callstack_hash = compute_callstack_hash(log_arr->callchain_strings, log_arr->callchain_size);
         }
     }
     return addr;
@@ -256,6 +273,7 @@ extern "C" void *memalign(size_t align, size_t sz)
             log_arr->size = sz;
             log_arr->entry_type = 5;
             get_trace(&log_arr->callchain_size, log_arr->callchain_strings);
+            log_arr->callstack_hash = compute_callstack_hash(log_arr->callchain_strings, log_arr->callchain_size);
         }
     }
     return addr;
@@ -272,6 +290,7 @@ extern "C" int posix_memalign(void **ptr, size_t align, size_t sz)
             log_arr->size = sz;
             log_arr->entry_type = 6;
             get_trace(&log_arr->callchain_size, log_arr->callchain_strings);
+            log_arr->callstack_hash = compute_callstack_hash(log_arr->callchain_strings, log_arr->callchain_size);
         }
     }
     return ret;
@@ -288,6 +307,7 @@ extern "C" void free(void *p)
             log_arr->size = 0;
             log_arr->entry_type = 2;
             get_trace(&log_arr->callchain_size, log_arr->callchain_strings);
+            log_arr->callstack_hash = compute_callstack_hash(log_arr->callchain_strings, log_arr->callchain_size);
         }
     }
     libc_free(p);
@@ -335,6 +355,7 @@ extern "C" void *mmap(void *start, size_t length, int prot, int flags, int fd, o
             log_arr->size = length;
             log_arr->entry_type = flags + 100;
             get_trace(&log_arr->callchain_size, log_arr->callchain_strings);
+            log_arr->callstack_hash = compute_callstack_hash(log_arr->callchain_strings, log_arr->callchain_size);
         }
     }
     return addr;
@@ -352,6 +373,7 @@ extern "C" void *mmap64(void *start, size_t length, int prot, int flags, int fd,
             log_arr->size = length * 4 * 1024;
             log_arr->entry_type = flags + 200;
             get_trace(&log_arr->callchain_size, log_arr->callchain_strings);
+            log_arr->callstack_hash = compute_callstack_hash(log_arr->callchain_strings, log_arr->callchain_size);
         }
     }
     return addr;
@@ -386,6 +408,7 @@ void __attribute__((destructor)) bye(void)
             _in_trace = 1;
             char **strings = backtrace_symbols(l->callchain_strings, l->callchain_size);
             if (l->callchain_size >= 4) {
+                fprintf(file, "0x%016lx ", (unsigned long)l->callstack_hash);
                 fprintf(file, "%s ", strings[3]);
                 fprintf(file, "%lu %lu %lx %d ", l->rdt, (long unsigned)l->size, 
                 (long unsigned)l->addr, (int)l->entry_type);
@@ -397,6 +420,7 @@ void __attribute__((destructor)) bye(void)
                             (unsigned long)l->callchain_strings[3] - (unsigned long)info.dli_fbase);
                 }
             }else {
+                fprintf(file, "0x%016lx ", (unsigned long)l->callstack_hash);
                 fprintf(file, "unknown ");
                 fprintf(file, "%lu %lu %lx %d\n", l->rdt, (long unsigned)l->size, 
                 (long unsigned)l->addr, (int)l->entry_type);
