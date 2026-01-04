@@ -41,7 +41,7 @@
 #define INTERLEAVE_THRESHOLD 4096  /* Minimum size for interleave allocation */
 #define MAX_HASH_ENTRIES 1000
 static uint64_t obj_hashes[MAX_HASH_ENTRIES];
-static int obj_place_flags[MAX_HASH_ENTRIES];          // 0: libc, 1: interweave, 2: h-alloc (CXL)
+static int obj_place_flags[MAX_HASH_ENTRIES];          // 0: libc, 1: interleave, 2: h-alloc (CXL)
 static long long obj_heate_cnts[MAX_HASH_ENTRIES];     // optional
 static double obj_bw_scores[MAX_HASH_ENTRIES];         // optional
 static int obj_count = 0;
@@ -49,7 +49,7 @@ static int obj_count = 0;
 struct addr_seg {
     long unsigned start;
     long unsigned end;
-    int place_flag;   // 0: libc, 1: interweave, 2: h-alloc
+    int place_flag;   // 0: libc, 1: interleave, 2: h-alloc
 };
 static int __thread _in_trace = 0;
 static struct addr_seg addr_segs[MAX_OBJECTS];
@@ -64,12 +64,12 @@ static pthread_mutex_t seg_lock = PTHREAD_MUTEX_INITIALIZER;
 
 
 /* Function declarations */
-void *interweave_malloc(size_t size);
-void interweave_free(void *ptr);
-void *interweave_calloc(size_t nmemb, size_t size);
-void *interweave_realloc(void *ptr, size_t size);
-void *interweave_aligned_alloc(size_t alignment, size_t size);
-int interweave_posix_memalign(void **memptr, size_t alignment, size_t sz);
+void *interleave_malloc(size_t size);
+void interleave_free(void *ptr);
+void *interleave_calloc(size_t nmemb, size_t size);
+void *interleave_realloc(void *ptr, size_t size);
+void *interleave_aligned_alloc(size_t alignment, size_t size);
+int interleave_posix_memalign(void **memptr, size_t alignment, size_t sz);
 void ensure_mapping_funcs(void);
 
 void *hmalloc(size_t size);
@@ -280,7 +280,7 @@ void *malloc(size_t sz)
                     return addr;
                 }
             } else if (pf == 1) {
-                addr = interweave_malloc(sz);
+                addr = interleave_malloc(sz);
                 if (addr) {
                     return addr;
                 }
@@ -321,11 +321,11 @@ void *calloc(size_t nmemb, size_t size)
                     return addr;
                 }
             } else if (pf == 1) {
-                void *addr = interweave_calloc(nmemb, size);
+                void *addr = interleave_calloc(nmemb, size);
                 if (addr) {
                     return addr;
                 }
-                CXL_LOG("interweave_calloc failed, falling back to libc_calloc");
+                CXL_LOG("interleave_calloc failed, falling back to libc_calloc");
             }
         }
     }
@@ -354,7 +354,7 @@ void *realloc(void *ptr, size_t size)
     pthread_mutex_unlock(&seg_lock);
     
     if (pf == 1) {
-        return interweave_realloc(ptr, size);
+        return interleave_realloc(ptr, size);
     } else if (pf == 2) {
         return hrealloc(ptr, size);
     }
@@ -385,7 +385,7 @@ void *memalign(size_t align, size_t sz)
                     return addr;
                 }
             } else if (pf == 1) {
-                void *addr = interweave_aligned_alloc(align, sz);
+                void *addr = interleave_aligned_alloc(align, sz);
                 if (addr) {
                     return addr;
                 }
@@ -419,7 +419,7 @@ int posix_memalign(void **ptr, size_t align, size_t sz)
                     return 0;
                 }
             } else if (pf == 1) {
-                int ret = interweave_posix_memalign(ptr, align, sz);
+                int ret = interleave_posix_memalign(ptr, align, sz);
                 if (ret == 0) {
                     return 0;
                 }
@@ -625,7 +625,7 @@ __attribute__((constructor)) void m_init(void) {
 }
  
 /*
- * Interweave malloc: allocates memory and binds pages according to interleave ratio.
+ * interleave malloc: allocates memory and binds pages according to interleave ratio.
  */
 void ensure_mapping_funcs(void)
 {
@@ -651,7 +651,7 @@ static int apply_interleave_policy(void *addr, size_t len)
     return 0;
 }
 
-void *interweave_malloc(size_t size)
+void *interleave_malloc(size_t size)
 {
     ensure_mapping_funcs();
     if (unlikely(!libc_mmap || !libc_munmap)) {
@@ -675,7 +675,7 @@ void *interweave_malloc(size_t size)
     return base;
 }
 
-void interweave_free(void *ptr)
+void interleave_free(void *ptr)
 {
     // 保留原实现（free 中直接使用 libc_munmap(size_to_free)）
     ensure_mapping_funcs();
@@ -691,7 +691,7 @@ void interweave_free(void *ptr)
     return;
 }
 
-void *interweave_calloc(size_t nmemb, size_t size)
+void *interleave_calloc(size_t nmemb, size_t size)
 {
     if (size != 0 && nmemb > SIZE_MAX / size) {
         errno = ENOMEM;
@@ -699,7 +699,7 @@ void *interweave_calloc(size_t nmemb, size_t size)
     }
     
     size_t total = nmemb * size;
-    void *ptr = interweave_malloc(total);
+    void *ptr = interleave_malloc(total);
     
     if (likely(ptr)) {
         memset(ptr, 0, total);
@@ -707,17 +707,17 @@ void *interweave_calloc(size_t nmemb, size_t size)
     return ptr;
 }
 
-void *interweave_realloc(void *ptr, size_t size)
+void *interleave_realloc(void *ptr, size_t size)
 {
     ensure_mapping_funcs();
     if (unlikely(!libc_munmap))
         return NULL;
 
     if (ptr == NULL)
-        return interweave_malloc(size);
+        return interleave_malloc(size);
     
     if (size == 0) {
-        interweave_free(ptr);
+        interleave_free(ptr);
         return NULL;
     }
     
@@ -733,7 +733,7 @@ void *interweave_realloc(void *ptr, size_t size)
     }
     
     /* Allocate new memory */
-    void *new_ptr = interweave_malloc(size);
+    void *new_ptr = interleave_malloc(size);
     if (!new_ptr)
         return NULL;
     
@@ -748,7 +748,7 @@ void *interweave_realloc(void *ptr, size_t size)
     return new_ptr;
 }
 
-void *interweave_aligned_alloc(size_t alignment, size_t size)
+void *interleave_aligned_alloc(size_t alignment, size_t size)
 {
     ensure_mapping_funcs();
     if (unlikely(!libc_mmap || !libc_munmap)) {
@@ -823,24 +823,24 @@ void *aligned_alloc(size_t alignment, size_t size)
                 }
                 CXL_LOG("haligned_alloc failed, falling back to libc aligned_alloc");
             } else if (pf == 1) {
-                void *addr = interweave_aligned_alloc(alignment, size);
+                void *addr = interleave_aligned_alloc(alignment, size);
                 if (addr) {
                     return addr;
                 }
-                CXL_LOG("interweave_aligned_alloc failed, falling back to libc aligned_alloc");
+                CXL_LOG("interleave_aligned_alloc failed, falling back to libc aligned_alloc");
             }
         }
     }
     return libc_aligned_alloc(alignment, size);
 }
 
-int interweave_posix_memalign(void **memptr, size_t alignment, size_t sz)
+int interleave_posix_memalign(void **memptr, size_t alignment, size_t sz)
 {
     if (!memptr || alignment < sizeof(void *) || alignment % sizeof(void *) || !is_pow2(alignment)) {
         return EINVAL;
     }
 
-    void *ptr = interweave_aligned_alloc(alignment, sz);
+    void *ptr = interleave_aligned_alloc(alignment, sz);
     if (!ptr) {
         return ENOMEM;
     }
