@@ -24,7 +24,7 @@
 #define USE_FRAME_POINTER   0      /* Use Frame Pointers to compute the stack trace (faster) */
 #define CALLCHAIN_SIZE      10     /* stack trace length - 增大以区分更深的调用路径 */
 #define RESOLVE_SYMBS       1      /* Resolve symbols at the end of the execution; quite costly */
-
+#define FNV_PRIME (1099511628211ULL)
 #define NB_ALLOC_TO_IGNORE   0     /* Ignore the first X allocations. */
 #define IGNORE_FIRST_PROCESS 0     /* Ignore the first process (and all its threads). Useful for processes */
 
@@ -72,7 +72,11 @@ static int __thread _in_trace = 0;
 #define get_bp(bp) asm("movq %%rbp, %0" : "=r" (bp) :)
 
 static __attribute__((unused)) int in_first_dlsym = 0;
-static char empty_data[32];
+static char empty_data[1024];              // Increased from 32 to 1024
+static char empty_realloc_data[8192];      // Increased from 4096 to 8192
+static char empty_calloc_data[8192];       // Separate buffer for calloc
+static int init_done = 0;
+static int in_init = 0;    // Prevent recursive initialization
 
 static void *(*libc_malloc)(size_t);
 static void *(*libc_calloc)(size_t, size_t);
@@ -148,18 +152,18 @@ static uint64_t fnv1a_hash(const unsigned char *data, size_t len)
     uint64_t hash = 14695981039346656037ULL; // FNV offset basis
     for (size_t i = 0; i < len; i++) {
         hash ^= data[i];
-        hash *= 1099511628211ULL; // FNV prime
+        hash *= FNV_PRIME;
     }
     return hash;
 }
 
-static uint64_t compute_callstack_hash(void **callchain, size_t size)
+static uint64_t compute_callstack_hash(void **callchain, size_t callchain_size, size_t alloc_size)
 {
     unsigned long offsets[CALLCHAIN_SIZE];
     Dl_info info;
     size_t offset_count = 0;
     
-    for (size_t i = 0; i < size && i < CALLCHAIN_SIZE; i++) {
+    for (size_t i = 0; i < callchain_size && i < CALLCHAIN_SIZE; i++) {
         if (dladdr(callchain[i], &info) && info.dli_fbase) {
             // Skip shared library frames (only hash main program frames)
             if (info.dli_fname && strstr(info.dli_fname, ".so")) {
@@ -170,10 +174,14 @@ static uint64_t compute_callstack_hash(void **callchain, size_t size)
     }
     
     if (offset_count == 0) {
-        return 0;
+        return fnv1a_hash((const unsigned char *)&alloc_size, sizeof(alloc_size));
     }
     
-    return fnv1a_hash((const unsigned char *)offsets, offset_count * sizeof(unsigned long));
+    uint64_t hash = fnv1a_hash((const unsigned char *)offsets, offset_count * sizeof(unsigned long));
+    hash ^= alloc_size;
+    hash *= FNV_PRIME;
+    
+    return hash;
 }
 
 int get_trace(size_t *size, void **strings)
@@ -199,12 +207,23 @@ static unsigned long get_symbol_offset(void *addr)
 
 extern "C" void *malloc(size_t sz)
 {
-    if (!libc_malloc)
+    if (!libc_malloc) {
+        if (in_init) {
+            // During initialization, return static buffer for small allocations
+            if (sz <= sizeof(empty_data)) {
+                return empty_data;
+            }
+            return NULL;
+        }
         m_init();
+    }
+    if (!libc_malloc)
+        return NULL;
+    
     void *addr;
     struct log *log_arr;
     addr = libc_malloc(sz);
-    if (!_in_trace) {
+    if (!_in_trace && init_done) {
         log_arr = get_log();
         if (log_arr) {
             rdtscll(log_arr->rdt);
@@ -212,34 +231,45 @@ extern "C" void *malloc(size_t sz)
             log_arr->size = sz;
             log_arr->entry_type = 1;
             get_trace(&log_arr->callchain_size, log_arr->callchain_strings);
-            log_arr->callstack_hash = compute_callstack_hash(log_arr->callchain_strings, log_arr->callchain_size);
+            log_arr->callstack_hash = compute_callstack_hash(log_arr->callchain_strings, log_arr->callchain_size, sz);
 
             // Store offsets for addr2line
             for (size_t i = 0; i < log_arr->callchain_size; i++) {
                 log_arr->callchain_offsets[i] = get_symbol_offset(log_arr->callchain_strings[i]);
-            }        }
+            }
+        }
     }
     return addr;
 }
 
 extern "C" void *calloc(size_t nmemb, size_t size)
 {
-    void *addr;
+    size_t total = nmemb * size;
+    
     if (!libc_calloc) {
-        memset(empty_data, 0, sizeof(*empty_data));
-        addr = empty_data;
-    } else {
-        addr = libc_calloc(nmemb, size);
+        // Try to initialize first
+        if (!in_init) {
+            m_init();
+        }
+        if (!libc_calloc) {
+            if (total <= sizeof(empty_calloc_data)) {
+                memset(empty_calloc_data, 0, total);
+                return empty_calloc_data;
+            }
+            return NULL;
+        }
     }
-    if (!_in_trace && libc_calloc) {
+    
+    void *addr = libc_calloc(nmemb, size);
+    if (!_in_trace && init_done) {
         struct log *log_arr = get_log();
         if (log_arr) {
             rdtscll(log_arr->rdt);
             log_arr->addr = addr;
-            log_arr->size = nmemb * size;
+            log_arr->size = total;
             log_arr->entry_type = 3;
             get_trace(&log_arr->callchain_size, log_arr->callchain_strings);
-            log_arr->callstack_hash = compute_callstack_hash(log_arr->callchain_strings, log_arr->callchain_size);
+            log_arr->callstack_hash = compute_callstack_hash(log_arr->callchain_strings, log_arr->callchain_size, total);
         }
     }
     return addr;
@@ -247,8 +277,35 @@ extern "C" void *calloc(size_t nmemb, size_t size)
 
 extern "C" void *realloc(void *ptr, size_t size)
 {
+    // Handle realloc before initialization
+    if (!libc_realloc) {
+        if (in_init) {
+            // During init: if ptr is our static buffer or NULL, use static buffer
+            if (ptr == NULL || ptr == empty_data || ptr == empty_realloc_data) {
+                if (size <= sizeof(empty_realloc_data)) {
+                    return empty_realloc_data;
+                }
+            }
+            return NULL;
+        }
+        m_init();
+    }
+    if (!libc_realloc)
+        return NULL;
+    
+    // Don't pass our static buffers to real realloc
+    if (ptr == empty_data || ptr == empty_realloc_data) {
+        void *new_ptr = libc_malloc(size);
+        if (new_ptr && ptr) {
+            size_t copy_size = (ptr == empty_data) ? sizeof(empty_data) : sizeof(empty_realloc_data);
+            if (size < copy_size) copy_size = size;
+            memcpy(new_ptr, ptr, copy_size);
+        }
+        return new_ptr;
+    }
+    
     void *addr = libc_realloc(ptr, size);
-    if (!_in_trace) {
+    if (!_in_trace && init_done) {
         struct log *log_arr = get_log();
         if (log_arr) {
             rdtscll(log_arr->rdt);
@@ -256,7 +313,7 @@ extern "C" void *realloc(void *ptr, size_t size)
             log_arr->size = size;
             log_arr->entry_type = 4;
             get_trace(&log_arr->callchain_size, log_arr->callchain_strings);
-            log_arr->callstack_hash = compute_callstack_hash(log_arr->callchain_strings, log_arr->callchain_size);
+            log_arr->callstack_hash = compute_callstack_hash(log_arr->callchain_strings, log_arr->callchain_size, size);
         }
     }
     return addr;
@@ -264,8 +321,14 @@ extern "C" void *realloc(void *ptr, size_t size)
 
 extern "C" void *memalign(size_t align, size_t sz)
 {
+    if (!libc_memalign) {
+        m_init();
+    }
+    if (!libc_memalign)
+        return NULL;
+    
     void *addr = libc_memalign(align, sz);
-    if (!_in_trace) {
+    if (!_in_trace && init_done) {
         struct log *log_arr = get_log();
         if (log_arr) {
             rdtscll(log_arr->rdt);
@@ -273,7 +336,7 @@ extern "C" void *memalign(size_t align, size_t sz)
             log_arr->size = sz;
             log_arr->entry_type = 5;
             get_trace(&log_arr->callchain_size, log_arr->callchain_strings);
-            log_arr->callstack_hash = compute_callstack_hash(log_arr->callchain_strings, log_arr->callchain_size);
+            log_arr->callstack_hash = compute_callstack_hash(log_arr->callchain_strings, log_arr->callchain_size, sz);
         }
     }
     return addr;
@@ -281,8 +344,14 @@ extern "C" void *memalign(size_t align, size_t sz)
 
 extern "C" int posix_memalign(void **ptr, size_t align, size_t sz)
 {
+    if (!libc_posix_memalign) {
+        m_init();
+    }
+    if (!libc_posix_memalign)
+        return ENOMEM;
+    
     int ret = libc_posix_memalign(ptr, align, sz);
-    if (!_in_trace) {
+    if (!_in_trace && init_done) {
         struct log *log_arr = get_log();
         if (log_arr) {
             rdtscll(log_arr->rdt);
@@ -290,7 +359,7 @@ extern "C" int posix_memalign(void **ptr, size_t align, size_t sz)
             log_arr->size = sz;
             log_arr->entry_type = 6;
             get_trace(&log_arr->callchain_size, log_arr->callchain_strings);
-            log_arr->callstack_hash = compute_callstack_hash(log_arr->callchain_strings, log_arr->callchain_size);
+            log_arr->callstack_hash = compute_callstack_hash(log_arr->callchain_strings, log_arr->callchain_size, sz);
         }
     }
     return ret;
@@ -298,8 +367,20 @@ extern "C" int posix_memalign(void **ptr, size_t align, size_t sz)
 
 extern "C" void free(void *p)
 {
+    // Skip NULL pointer
+    if (!p)
+        return;
+    
+    // Skip the static buffers (used during early initialization)
+    if (p == empty_data || p == empty_realloc_data || p == empty_calloc_data)
+        return;
+    
+    // Skip if libc_free is not initialized yet
+    if (!libc_free)
+        return;
+    
     struct log *log_arr;
-    if (!_in_trace && libc_free) {
+    if (!_in_trace && init_done) {
         log_arr = get_log();
         if (log_arr) {
             rdtscll(log_arr->rdt);
@@ -307,7 +388,7 @@ extern "C" void free(void *p)
             log_arr->size = 0;
             log_arr->entry_type = 2;
             get_trace(&log_arr->callchain_size, log_arr->callchain_strings);
-            log_arr->callstack_hash = compute_callstack_hash(log_arr->callchain_strings, log_arr->callchain_size);
+            log_arr->callstack_hash = compute_callstack_hash(log_arr->callchain_strings, log_arr->callchain_size, 0);
         }
     }
     libc_free(p);
@@ -355,7 +436,7 @@ extern "C" void *mmap(void *start, size_t length, int prot, int flags, int fd, o
             log_arr->size = length;
             log_arr->entry_type = flags + 100;
             get_trace(&log_arr->callchain_size, log_arr->callchain_strings);
-            log_arr->callstack_hash = compute_callstack_hash(log_arr->callchain_strings, log_arr->callchain_size);
+            log_arr->callstack_hash = compute_callstack_hash(log_arr->callchain_strings, log_arr->callchain_size, length);
         }
     }
     return addr;
@@ -373,7 +454,7 @@ extern "C" void *mmap64(void *start, size_t length, int prot, int flags, int fd,
             log_arr->size = length * 4 * 1024;
             log_arr->entry_type = flags + 200;
             get_trace(&log_arr->callchain_size, log_arr->callchain_strings);
-            log_arr->callstack_hash = compute_callstack_hash(log_arr->callchain_strings, log_arr->callchain_size);
+            log_arr->callstack_hash = compute_callstack_hash(log_arr->callchain_strings, log_arr->callchain_size, length * 4 * 1024);
         }
     }
     return addr;
@@ -434,6 +515,11 @@ void __attribute__((destructor)) bye(void)
 
 void __attribute__((constructor)) m_init(void)
 {
+    if (init_done || in_init)
+        return;
+    
+    in_init = 1;
+    
     libc_malloc = (void * ( *)(size_t))dlsym(RTLD_NEXT, "malloc");
     libc_realloc = (void * ( *)(void *, size_t))dlsym(RTLD_NEXT, "realloc");
     libc_calloc = (void * ( *)(size_t, size_t))dlsym(RTLD_NEXT, "calloc");
@@ -443,4 +529,7 @@ void __attribute__((constructor)) m_init(void)
     libc_mmap64 = (void * ( *)(void *, size_t, int, int, int, off_t))dlsym(RTLD_NEXT, "mmap64");
     libc_memalign = (void * ( *)(size_t, size_t))dlsym(RTLD_NEXT, "memalign");
     libc_posix_memalign = (int ( *)(void **, size_t, size_t))dlsym(RTLD_NEXT, "posix_memalign");
+    
+    in_init = 0;
+    init_done = 1;
 }

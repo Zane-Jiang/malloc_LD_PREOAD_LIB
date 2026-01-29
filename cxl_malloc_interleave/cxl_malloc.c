@@ -37,6 +37,9 @@
 #define CXL_LOG(...) ((void)0)
 #endif
 
+
+#define FNV_PRIME (1099511628211ULL)
+
 #define MAX_OBJECTS          30000
 #define INTERLEAVE_THRESHOLD 4096  /* Minimum size for interleave allocation */
 #define MAX_HASH_ENTRIES 1000
@@ -103,13 +106,13 @@ static uint64_t fnv1a_hash(const unsigned char *data, size_t len)
     uint64_t hash = 14695981039346656037ULL; // FNV offset basis
     for (size_t i = 0; i < len; i++) {
         hash ^= data[i];
-        hash *= 1099511628211ULL; // FNV prime
+        hash *= FNV_PRIME; // FNV prime
     }
     return hash;
 }
 
 // Compute deterministic callstack hash (based on offsets, not runtime addresses)
-static uint64_t compute_callstack_hash(void **callchain, size_t size)
+static uint64_t compute_callstack_hash(void **callchain, size_t size, size_t alloc_size)
 {
     unsigned long offsets[CALLCHAIN_SIZE];
     Dl_info info;
@@ -127,10 +130,16 @@ static uint64_t compute_callstack_hash(void **callchain, size_t size)
     }
     
     if (offset_count == 0) {
-        return 0;
+        return fnv1a_hash((const unsigned char *)&alloc_size, sizeof(alloc_size));
     }
     
-    return fnv1a_hash((const unsigned char *)offsets, offset_count * sizeof(unsigned long));
+    // Compute hash of offsets first
+    uint64_t hash = fnv1a_hash((const unsigned char *)offsets, offset_count * sizeof(unsigned long));
+    
+    hash ^= alloc_size;
+    hash *= FNV_PRIME; // FNV prime
+    
+    return hash;
 }
 
 // Based on hash value, determine placement (0/1/2)
@@ -271,7 +280,7 @@ void *malloc(size_t sz)
             get_trace(&callchain_size_local, callchain_strings_local);
         }
         if (callchain_size_local >= 4) {
-            uint64_t callstack_hash = compute_callstack_hash(callchain_strings_local, callchain_size_local);
+            uint64_t callstack_hash = compute_callstack_hash(callchain_strings_local, callchain_size_local, sz);
             int pf = get_place_flag_by_hash(callstack_hash);
             if (pf == 2) {
                 addr = hmalloc(sz);
@@ -279,11 +288,13 @@ void *malloc(size_t sz)
                     record_seg((unsigned long)addr, 0, 2);
                     return addr;
                 }
+                CXL_LOG("hmalloc failed for size %zu, falling back to libc_malloc", sz);
             } else if (pf == 1) {
                 addr = interleave_malloc(sz);
                 if (addr) {
                     return addr;
                 }
+                CXL_LOG("interleave_malloc failed for size %zu, falling back to libc_malloc", sz);
             }
         }
     }
@@ -312,7 +323,7 @@ void *calloc(size_t nmemb, size_t size)
             get_trace(&callchain_size_local, callchain_strings_local);
         }
         if (callchain_size_local >= 4) {
-            uint64_t callstack_hash = compute_callstack_hash(callchain_strings_local, callchain_size_local);
+            uint64_t callstack_hash = compute_callstack_hash(callchain_strings_local, callchain_size_local, total);
             int pf = get_place_flag_by_hash(callstack_hash);
             if (pf == 2) {
                 void *addr = hcalloc(nmemb, size);
@@ -320,12 +331,13 @@ void *calloc(size_t nmemb, size_t size)
                     record_seg((unsigned long)addr, 0, 2);
                     return addr;
                 }
+                CXL_LOG("hcalloc failed for size %zu, falling back to libc_calloc", total);
             } else if (pf == 1) {
                 void *addr = interleave_calloc(nmemb, size);
                 if (addr) {
                     return addr;
                 }
-                CXL_LOG("interleave_calloc failed, falling back to libc_calloc");
+                CXL_LOG("interleave_calloc failed for size %zu, falling back to libc_calloc", total);
             }
         }
     }
@@ -376,7 +388,7 @@ void *memalign(size_t align, size_t sz)
             get_trace(&callchain_size_local, callchain_strings_local);
         }
         if (callchain_size_local >= 4) {
-            uint64_t callstack_hash = compute_callstack_hash(callchain_strings_local, callchain_size_local);
+            uint64_t callstack_hash = compute_callstack_hash(callchain_strings_local, callchain_size_local, sz);
             int pf = get_place_flag_by_hash(callstack_hash);
             if (pf == 2) {
                 void *addr = haligned_alloc(align, sz);
@@ -384,11 +396,13 @@ void *memalign(size_t align, size_t sz)
                     record_seg((unsigned long)addr, 0, 2);
                     return addr;
                 }
+                CXL_LOG("haligned_alloc failed for size %zu, falling back to libc_memalign", sz);
             } else if (pf == 1) {
                 void *addr = interleave_aligned_alloc(align, sz);
                 if (addr) {
                     return addr;
                 }
+                CXL_LOG("interleave_aligned_alloc failed for size %zu, falling back to libc_memalign", sz);
             }
         }
     }
@@ -410,7 +424,7 @@ int posix_memalign(void **ptr, size_t align, size_t sz)
             get_trace(&callchain_size_local, callchain_strings_local);
         }
         if (callchain_size_local >= 4) {
-            uint64_t callstack_hash = compute_callstack_hash(callchain_strings_local, callchain_size_local);
+            uint64_t callstack_hash = compute_callstack_hash(callchain_strings_local, callchain_size_local, sz);
             int pf = get_place_flag_by_hash(callstack_hash);
             if (pf == 2) {
                 int ret = hposix_memalign(ptr, align, sz);
@@ -418,11 +432,13 @@ int posix_memalign(void **ptr, size_t align, size_t sz)
                     record_seg((unsigned long)(*ptr), 0, 2);
                     return 0;
                 }
+                CXL_LOG("hposix_memalign failed for size %zu, falling back to libc", sz);
             } else if (pf == 1) {
                 int ret = interleave_posix_memalign(ptr, align, sz);
                 if (ret == 0) {
                     return 0;
                 }
+                CXL_LOG("interleave_posix_memalign failed for size %zu, falling back to libc", sz);
             }
         }
     }
@@ -537,10 +553,6 @@ __attribute__((constructor)) void m_init(void) {
 
     // Config file format:
     // hash_value,place_flag[,heate_count][,BW_Bound_score]
-    // Examples:
-    // 0x1234567890abcdef,1
-    // 0x1234567890abcdef,0,0,0.0
-    // 0x1234567890abcdef,0,12,0.87
     while (fgets(line, sizeof(line), file) != NULL && obj_count < MAX_HASH_ENTRIES) {
         char *cursor = line;
         size_t len = strcspn(cursor, "\r\n");
@@ -571,57 +583,6 @@ __attribute__((constructor)) void m_init(void) {
         obj_count++;
     }
     fclose(file);
-
-    // Apply placement rules:
-    // 1) heate_count == 0 -> flag = 2
-    // 2) Among the rest, top 10% by BW_Bound_score -> flag = 1
-    // 3) Others -> flag = 0
-    if (obj_count > 0) {
-        // collect eligible scores (heate_count != 0)
-        int eligible = 0;
-        for (int i = 0; i < obj_count; ++i) {
-            if (obj_heate_cnts[i] == 0) continue;
-            eligible++;
-        }
-        int topk = eligible / 10;
-        if (topk < 1 && eligible > 0) topk = 1;
-
-        double threshold = 0.0;
-        if (eligible > 0 && topk > 0) {
-            // copy scores
-            double *scores = (double *)libc_malloc(sizeof(double) * eligible);
-            if (scores) {
-                int idx = 0;
-                for (int i = 0; i < obj_count; ++i) {
-                    if (obj_heate_cnts[i] == 0) continue;
-                    scores[idx++] = obj_bw_scores[i];
-                }
-                // sort descending
-                int cmp_desc(const void *a, const void *b) {
-                    double da = *(const double *)a;
-                    double db = *(const double *)b;
-                    if (da < db) return 1;
-                    if (da > db) return -1;
-                    return 0;
-                }
-                qsort(scores, eligible, sizeof(double), cmp_desc);
-                threshold = scores[topk - 1];
-                libc_free(scores);
-            }
-        }
-
-        for (int i = 0; i < obj_count; ++i) {
-            if (obj_heate_cnts[i] == 0) {
-                obj_place_flags[i] = 2;
-            } else if (eligible > 0 && obj_bw_scores[i] >= threshold) {
-                obj_place_flags[i] = 1;
-            } else {
-                obj_place_flags[i] = 0;
-            }
-        }
-    }
-
-    CXL_LOG("Loaded %d hash entries (place_flag applied)", obj_count);
 }
  
 /*
@@ -813,7 +774,7 @@ void *aligned_alloc(size_t alignment, size_t size)
             get_trace(&callchain_size_local, callchain_strings_local);
         }
         if (callchain_size_local >= 4) {
-            uint64_t callstack_hash = compute_callstack_hash(callchain_strings_local, callchain_size_local);
+            uint64_t callstack_hash = compute_callstack_hash(callchain_strings_local, callchain_size_local, size);
             int pf = get_place_flag_by_hash(callstack_hash);
             if (pf == 2) {
                 void *addr = haligned_alloc(alignment, size);
