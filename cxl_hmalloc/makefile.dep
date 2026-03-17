@@ -1,2 +1,0 @@
-cxl_malloc.o: cxl_malloc.c env.h
-env.o: env.c

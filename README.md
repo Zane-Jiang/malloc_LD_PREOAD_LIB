@@ -7,13 +7,15 @@ Currently suport C++ \Fortran and C lang.
 ## Usage:
 #### Building:
   ```bash
-    git clone https://github.com/ljx0525/malloc_LD_PREOAD_LIB.git
-    cd malloc_LD_PREOAD_LIB/src
+    git clone https://github.com/zane-jiang/malloc_LD_PREOAD_LIB.git
+    cd malloc_LD_PREOAD_LIB/sora
     make
   ```
 #### Usage of LD_PRELOAD environment variable:
     export LD_PRELOAD=$LD_PRELOAD:$(pwd)/lib/libMallocHook.so
 
 ### sora
-  `sora` dir copy from sora, has greater perfomance in mult-thread environment than mine。
+  `sora` dir copy from sora, has greater perfomance in mult-thread environment than mine。use to interplament.
+
+### cxl_mallc_
 

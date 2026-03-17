@@ -25,6 +25,7 @@
 #include <errno.h>
 #include <numaif.h>
 
+#define MADV_NOMIGRATE 26
 
 #define NUMA_DEFAULT_NODE (-1)
 #define NUMA_LOCAL_NODE 0
@@ -48,6 +49,7 @@ static int obj_place_flags[MAX_HASH_ENTRIES];          // 0: libc, 1: interleave
 static long long obj_heate_cnts[MAX_HASH_ENTRIES];     // optional
 static double obj_bw_scores[MAX_HASH_ENTRIES];         // optional
 static int obj_count = 0;
+static int enable_madvise = 1;  /* Controls whether madvise is enabled (default: enabled) */
 
 struct addr_seg {
     long unsigned start;
@@ -285,6 +287,7 @@ void *malloc(size_t sz)
             if (pf == 2) {
                 addr = hmalloc(sz);
                 if (addr) {
+                    if (enable_madvise) madvise(addr, sz, MADV_COLD);
                     record_seg((unsigned long)addr, 0, 2);
                     return addr;
                 }
@@ -525,6 +528,12 @@ __attribute__((constructor)) void hmalloc_init(void) {
 }
 
 __attribute__((constructor)) void m_init(void) {
+    /* Read madvise enable flag from environment variable */
+    const char *enable_madvise_env = getenv("CXL_MALLOC_ENABLE_MADVISE");
+    if (enable_madvise_env) {
+        enable_madvise = (atoi(enable_madvise_env) != 0) ? 1 : 0;
+        CXL_LOG("CXL_MALLOC_ENABLE_MADVISE=%d", enable_madvise);
+    }
     libc_malloc = (void * (*)(size_t))dlsym(RTLD_NEXT, "malloc");
     libc_realloc = (void * (*)(void *, size_t))dlsym(RTLD_NEXT, "realloc");
     libc_calloc = (void * (*)(size_t, size_t))dlsym(RTLD_NEXT, "calloc");
@@ -607,6 +616,10 @@ static int apply_interleave_policy(void *addr, size_t len)
 
     if (mbind(addr, len, MPOL_WEIGHTED_INTERLEAVE, &nodemask, maxnode, MPOL_MF_MOVE) != 0) {
         CXL_LOG("mbind interleave failed: %s", strerror(errno));
+        return -1;
+    }
+    if (madvise(addr, len, MADV_NOMIGRATE) != 0) {
+        CXL_LOG("madvise MADV_MIGRATE failed: %s", strerror(errno));
         return -1;
     }
     return 0;
