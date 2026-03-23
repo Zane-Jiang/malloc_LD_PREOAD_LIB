@@ -284,14 +284,12 @@ void *malloc(size_t sz)
         if (callchain_size_local >= 4) {
             uint64_t callstack_hash = compute_callstack_hash(callchain_strings_local, callchain_size_local, sz);
             int pf = get_place_flag_by_hash(callstack_hash);
-            if (pf == 2) {
-                addr = hmalloc(sz);
-                if (addr) {
-                    if (enable_madvise) madvise(addr, sz, MADV_COLD);
-                    record_seg((unsigned long)addr, 0, 2);
+            if (pf == 2 || pf == 0) {
+                addr = libc_malloc(sz);
+                if(addr) {
+                    if (enable_madvise && pf == 2) madvise(addr, sz, MADV_COLD);
                     return addr;
                 }
-                CXL_LOG("hmalloc failed for size %zu, falling back to libc_malloc", sz);
             } else if (pf == 1) {
                 addr = interleave_malloc(sz);
                 if (addr) {
