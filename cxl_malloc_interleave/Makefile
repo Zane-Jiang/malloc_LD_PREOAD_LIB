@@ -12,7 +12,7 @@ makefile.dep: $(SRCS) $(wildcard *.h)
 -include makefile.dep
 
 libCXLMalloc.so: $(OBJS)
-	gcc -shared -Wl,-soname,libCXLMalloc.so -o $(LIB_DIR)/$@ $(OBJS) -ljemalloc	-ldl -lpthread -lnuma
+	gcc -shared -Wl,-soname,libCXLMalloc.so -o $(LIB_DIR)/$@ $(OBJS) -ldl -lpthread -lnuma
 
 %.o: %.c
 	gcc -fPIC ${CFLAGS} -c $< -o $@

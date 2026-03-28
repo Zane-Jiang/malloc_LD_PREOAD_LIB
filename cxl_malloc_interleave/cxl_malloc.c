@@ -3,7 +3,6 @@
 #endif
 #define __USE_GNU
 
-#include <jemalloc/jemalloc.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <sys/mman.h>
@@ -23,6 +22,7 @@
 #include <ctype.h>
 #include <sched.h>
 #include <errno.h>
+#include <limits.h>
 #include <numaif.h>
 
 #define MADV_NOMIGRATE 26
@@ -45,11 +45,83 @@
 #define INTERLEAVE_THRESHOLD 4096  /* Minimum size for interleave allocation */
 #define MAX_HASH_ENTRIES 1000
 static uint64_t obj_hashes[MAX_HASH_ENTRIES];
-static int obj_place_flags[MAX_HASH_ENTRIES];          // 0: libc, 1: interleave, 2: h-alloc (CXL)
+static int obj_place_flags[MAX_HASH_ENTRIES];          // 0: local, 1..4: interleave tiers, 5: CXL cold
 static long long obj_heate_cnts[MAX_HASH_ENTRIES];     // optional
 static double obj_bw_scores[MAX_HASH_ENTRIES];         // optional
 static int obj_count = 0;
 static int enable_madvise = 1;  /* Controls whether madvise is enabled (default: enabled) */
+
+static int interleave_node0_weights[6] = {0, 5, 4, 3, 2, 0};
+static int interleave_node1_weights[6] = {0, 1, 1, 1, 1, 0};
+static int current_interleave_flag = -1;
+static pthread_mutex_t interleave_cfg_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int parse_ratio_pair(const char *s, int *a, int *b)
+{
+    if (!s || !a || !b) return -1;
+    int x = -1, y = -1;
+    if (sscanf(s, "%d:%d", &x, &y) != 2) return -1;
+    if (x <= 0 || y <= 0) return -1;
+    *a = x;
+    *b = y;
+    return 0;
+}
+
+static void load_interleave_ratio_env(void)
+{
+    const char *keys[4] = {
+        "CXL_MALLOC_INTERLEAVE_L1",
+        "CXL_MALLOC_INTERLEAVE_L2",
+        "CXL_MALLOC_INTERLEAVE_L3",
+        "CXL_MALLOC_INTERLEAVE_L4",
+    };
+    for (int i = 0; i < 4; i++) {
+        const char *v = getenv(keys[i]);
+        if (!v) continue;
+        int n0 = 0, n1 = 0;
+        if (parse_ratio_pair(v, &n0, &n1) == 0) {
+            interleave_node0_weights[i + 1] = n0;
+            interleave_node1_weights[i + 1] = n1;
+            CXL_LOG("%s=%d:%d", keys[i], n0, n1);
+        }
+    }
+}
+
+static int write_int_to_sysfs(const char *path, int value)
+{
+    FILE *fp = fopen(path, "w");
+    if (!fp) return -1;
+    int ret = fprintf(fp, "%d", value);
+    fclose(fp);
+    return (ret > 0) ? 0 : -1;
+}
+
+static int apply_interleave_weights_for_flag(int place_flag)
+{
+    if (place_flag < 1 || place_flag > 4) {
+        return 0;
+    }
+    if (current_interleave_flag == place_flag) {
+        return 0;
+    }
+
+    pthread_mutex_lock(&interleave_cfg_lock);
+    if (current_interleave_flag != place_flag) {
+        int w0 = interleave_node0_weights[place_flag];
+        int w1 = interleave_node1_weights[place_flag];
+        int ok0 = write_int_to_sysfs("/sys/kernel/mm/mempolicy/weighted_interleave/node0", w0);
+        int ok1 = write_int_to_sysfs("/sys/kernel/mm/mempolicy/weighted_interleave/node1", w1);
+        if (ok0 == 0 && ok1 == 0) {
+               current_interleave_flag = place_flag;
+        } else {
+            CXL_LOG("set weighted interleave failed for flag=%d (%d:%d), errno=%d", place_flag, w0, w1, errno);
+            pthread_mutex_unlock(&interleave_cfg_lock);
+            return -1;
+        }
+    }
+    pthread_mutex_unlock(&interleave_cfg_lock);
+    return 0;
+}
 
 struct addr_seg {
     long unsigned start;
@@ -69,23 +141,12 @@ static pthread_mutex_t seg_lock = PTHREAD_MUTEX_INITIALIZER;
 
 
 /* Function declarations */
-void *interleave_malloc(size_t size);
-void interleave_free(void *ptr);
-void *interleave_calloc(size_t nmemb, size_t size);
+void *interleave_malloc_with_flag(size_t size, int place_flag);
+void *interleave_calloc_with_flag(size_t nmemb, size_t size, int place_flag);
 void *interleave_realloc(void *ptr, size_t size);
-void *interleave_aligned_alloc(size_t alignment, size_t size);
-int interleave_posix_memalign(void **memptr, size_t alignment, size_t sz);
+void *interleave_aligned_alloc_with_flag(size_t alignment, size_t size, int place_flag);
+int interleave_posix_memalign_with_flag(void **memptr, size_t alignment, size_t sz, int place_flag);
 void ensure_mapping_funcs(void);
-
-void *hmalloc(size_t size);
-void hfree(void *ptr);
-void *hcalloc(size_t nmemb, size_t size);
-void *hrealloc(void *ptr, size_t size);
-void *haligned_alloc(size_t alignment, size_t size);
-int hposix_memalign(void **memptr, size_t alignment, size_t size);
-void *hmmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset);
-int hmunmap(void *addr, size_t length);
-size_t hmalloc_usable_size(void *ptr);
 
 
 static void *(*libc_malloc)(size_t) = NULL;
@@ -244,13 +305,9 @@ size_t malloc_usable_size(void *ptr)
     pthread_mutex_lock(&seg_lock);
     struct addr_seg *seg = find_seg((unsigned long)ptr);
     size_t sz = seg ? seg_length(seg) : 0;
-    int pf = seg ? seg->place_flag : 0;
     pthread_mutex_unlock(&seg_lock);
 
     if (seg) {
-        if (pf == 2) {
-            return hmalloc_usable_size(ptr);
-        }
         if (sz > 0) {
             return sz;
         }
@@ -284,14 +341,14 @@ void *malloc(size_t sz)
         if (callchain_size_local >= 4) {
             uint64_t callstack_hash = compute_callstack_hash(callchain_strings_local, callchain_size_local, sz);
             int pf = get_place_flag_by_hash(callstack_hash);
-            if (pf == 2 || pf == 0) {
+            if (pf == 5 || pf == 0) {
                 addr = libc_malloc(sz);
                 if(addr) {
-                    if (enable_madvise && pf == 2) madvise(addr, sz, MADV_COLD);
+                    if (enable_madvise && pf == 5) madvise(addr, sz, MADV_COLD);
                     return addr;
                 }
-            } else if (pf == 1) {
-                addr = interleave_malloc(sz);
+            } else if (pf >= 1 && pf <= 4) {
+                addr = interleave_malloc_with_flag(sz, pf);
                 if (addr) {
                     return addr;
                 }
@@ -326,15 +383,14 @@ void *calloc(size_t nmemb, size_t size)
         if (callchain_size_local >= 4) {
             uint64_t callstack_hash = compute_callstack_hash(callchain_strings_local, callchain_size_local, total);
             int pf = get_place_flag_by_hash(callstack_hash);
-            if (pf == 2) {
-                void *addr = hcalloc(nmemb, size);
+            if (pf == 5 || pf == 0) {
+                void *addr = libc_calloc(nmemb, size);
                 if (addr) {
-                    record_seg((unsigned long)addr, 0, 2);
+                    if (enable_madvise && pf == 5) madvise(addr, total, MADV_COLD);
                     return addr;
                 }
-                CXL_LOG("hcalloc failed for size %zu, falling back to libc_calloc", total);
-            } else if (pf == 1) {
-                void *addr = interleave_calloc(nmemb, size);
+            } else if (pf >= 1 && pf <= 4) {
+                void *addr = interleave_calloc_with_flag(nmemb, size, pf);
                 if (addr) {
                     return addr;
                 }
@@ -366,10 +422,8 @@ void *realloc(void *ptr, size_t size)
     int pf = seg ? seg->place_flag : 0;
     pthread_mutex_unlock(&seg_lock);
     
-    if (pf == 1) {
+    if (pf >= 1 && pf <= 4) {
         return interleave_realloc(ptr, size);
-    } else if (pf == 2) {
-        return hrealloc(ptr, size);
     }
     
     return libc_realloc(ptr, size);
@@ -391,15 +445,14 @@ void *memalign(size_t align, size_t sz)
         if (callchain_size_local >= 4) {
             uint64_t callstack_hash = compute_callstack_hash(callchain_strings_local, callchain_size_local, sz);
             int pf = get_place_flag_by_hash(callstack_hash);
-            if (pf == 2) {
-                void *addr = haligned_alloc(align, sz);
+            if (pf == 5 || pf == 0) {
+                void *addr = libc_memalign(align, sz);
                 if (addr) {
-                    record_seg((unsigned long)addr, 0, 2);
+                    if (enable_madvise && pf == 5) madvise(addr, sz, MADV_COLD);
                     return addr;
                 }
-                CXL_LOG("haligned_alloc failed for size %zu, falling back to libc_memalign", sz);
-            } else if (pf == 1) {
-                void *addr = interleave_aligned_alloc(align, sz);
+            } else if (pf >= 1 && pf <= 4) {
+                void *addr = interleave_aligned_alloc_with_flag(align, sz, pf);
                 if (addr) {
                     return addr;
                 }
@@ -427,15 +480,14 @@ int posix_memalign(void **ptr, size_t align, size_t sz)
         if (callchain_size_local >= 4) {
             uint64_t callstack_hash = compute_callstack_hash(callchain_strings_local, callchain_size_local, sz);
             int pf = get_place_flag_by_hash(callstack_hash);
-            if (pf == 2) {
-                int ret = hposix_memalign(ptr, align, sz);
+            if (pf == 5 || pf == 0) {
+                int ret = libc_posix_memalign(ptr, align, sz);
                 if (ret == 0) {
-                    record_seg((unsigned long)(*ptr), 0, 2);
+                    if (enable_madvise && pf == 5) madvise(*ptr, sz, MADV_COLD);
                     return 0;
                 }
-                CXL_LOG("hposix_memalign failed for size %zu, falling back to libc", sz);
-            } else if (pf == 1) {
-                int ret = interleave_posix_memalign(ptr, align, sz);
+            } else if (pf >= 1 && pf <= 4) {
+                int ret = interleave_posix_memalign_with_flag(ptr, align, sz, pf);
                 if (ret == 0) {
                     return 0;
                 }
@@ -457,13 +509,11 @@ void free(void *p)
     int place_flag = 0;
     size_t size_to_free = check_seg((unsigned long)p, &place_flag);
     
-    if (place_flag == 1) {
+    if (place_flag >= 1 && place_flag <= 4) {
         ensure_mapping_funcs();
         if (likely(libc_munmap && size_to_free > 0)) {
             libc_munmap(p, size_to_free);
         }
-    } else if (place_flag == 2) {
-        hfree(p);
     } else {
         libc_free(p);
     }
@@ -496,35 +546,6 @@ int munmap(void *start, size_t length)
     return libc_munmap(start, length);
 }
 
-
-static unsigned arena_index;
-static extent_hooks_t *hooks;
-static int maxnode;
-
-void *extent_alloc(extent_hooks_t *extent_hooks __unused, void *new_addr, size_t size,
-                   size_t alignment __unused, bool *zero __unused, bool *commit __unused,
-                   unsigned arena_ind __unused) {
-    new_addr = hmmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, 0, 0);
-    return new_addr;
-}
-static bool extent_dalloc(extent_hooks_t *extent_hooks __unused, void *addr, size_t size,
-                          bool committed __unused, unsigned arena_ind __unused) {
-    return hmunmap(addr, size);
-}
-static extent_hooks_t extent_hooks = {
-    .alloc = extent_alloc,
-    .dalloc = extent_dalloc,
-};
-__attribute__((constructor)) void hmalloc_init(void) {
-    int err __unused;
-    size_t unsigned_size = sizeof(unsigned);
-    maxnode = numa_max_node() + 2;
-    hooks = &extent_hooks;
-    err = mallctl("arenas.create", &arena_index, &unsigned_size, (void *)&hooks,
-                      sizeof(extent_hooks_t *));
-    assert(!err);
-}
-
 __attribute__((constructor)) void m_init(void) {
     /* Read madvise enable flag from environment variable */
     const char *enable_madvise_env = getenv("CXL_MALLOC_ENABLE_MADVISE");
@@ -542,6 +563,8 @@ __attribute__((constructor)) void m_init(void) {
     libc_memalign = (void * (*)(size_t, size_t))dlsym(RTLD_NEXT, "memalign");
     libc_posix_memalign = (int (*)(void **, size_t, size_t))dlsym(RTLD_NEXT, "posix_memalign");
     libc_aligned_alloc = (void * (*)(size_t, size_t))dlsym(RTLD_NEXT, "aligned_alloc");
+
+    load_interleave_ratio_env();
 
     FILE *file;
     char line[256];
@@ -580,6 +603,8 @@ __attribute__((constructor)) void m_init(void) {
 
         uint64_t hash_value = strtoull(t1, NULL, 0);
         int place_flag = (int)strtol(t2, NULL, 10);
+        if (place_flag < 0) place_flag = 0;
+        if (place_flag > 5) place_flag = 5;
         long long heate_cnt = (t3 && *t3) ? strtoll(t3, NULL, 10) : LLONG_MIN; // LLONG_MIN -> not provided
         double bw_score = (t4 && *t4) ? strtod(t4, NULL) : 0.0;
 
@@ -607,7 +632,7 @@ void ensure_mapping_funcs(void)
 
 
 
-static int apply_interleave_policy(void *addr, size_t len)
+static int apply_interleave_policy(void *addr, size_t len, int place_flag)
 {
     unsigned long nodemask = (1UL << NUMA_LOCAL_NODE) | (1UL << NUMA_CXL_NODE);
     unsigned long maxnode = sizeof(nodemask) * 8;
@@ -616,20 +641,29 @@ static int apply_interleave_policy(void *addr, size_t len)
         CXL_LOG("mbind interleave failed: %s", strerror(errno));
         return -1;
     }
-    if (madvise(addr, len, MADV_NOMIGRATE) != 0) {
-        CXL_LOG("madvise MADV_MIGRATE failed: %s", strerror(errno));
-        return -1;
+    // Only set MADV_NOMIGRATE for tier >= 3 
+    if (place_flag >= 3) {
+        if (madvise(addr, len, MADV_NOMIGRATE) != 0) {
+            CXL_LOG("madvise MADV_NOMIGRATE failed: %s", strerror(errno));
+            return -1;
+        }
     }
     return 0;
 }
 
-void *interleave_malloc(size_t size)
+void *interleave_malloc_with_flag(size_t size, int place_flag)
 {
     ensure_mapping_funcs();
     if (unlikely(!libc_mmap || !libc_munmap)) {
         errno = ENOSYS;
         return NULL;
     }
+
+    // Apply the appropriate interleave weights for this place_flag
+    if (place_flag >= 1 && place_flag <= 4) {
+        apply_interleave_weights_for_flag(place_flag);
+    }
+
     /* Allocate a contiguous virtual memory region */
     size_t aligned_size = (size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
     void *base = libc_mmap(NULL, aligned_size, PROT_READ | PROT_WRITE, 
@@ -638,32 +672,16 @@ void *interleave_malloc(size_t size)
         return NULL;
     }
 
-    if (apply_interleave_policy(base, aligned_size) != 0) {
+    if (apply_interleave_policy(base, aligned_size, place_flag) != 0) {
         libc_munmap(base, aligned_size);
         return NULL;
     }
 
-    record_seg((unsigned long)base, aligned_size, 1);
+    record_seg((unsigned long)base, aligned_size, place_flag);
     return base;
 }
 
-void interleave_free(void *ptr)
-{
-    // 保留原实现（free 中直接使用 libc_munmap(size_to_free)）
-    ensure_mapping_funcs();
-    if (unlikely(!libc_munmap) || ptr == NULL)
-        return;
-    pthread_mutex_lock(&seg_lock);
-    struct addr_seg *seg = find_seg((unsigned long)ptr);
-    size_t size = seg ? seg_length(seg) : 0;
-    pthread_mutex_unlock(&seg_lock);
-    if (size > 0) {
-        libc_munmap(ptr, size);
-    }
-    return;
-}
-
-void *interleave_calloc(size_t nmemb, size_t size)
+void *interleave_calloc_with_flag(size_t nmemb, size_t size, int place_flag)
 {
     if (size != 0 && nmemb > SIZE_MAX / size) {
         errno = ENOMEM;
@@ -671,7 +689,7 @@ void *interleave_calloc(size_t nmemb, size_t size)
     }
     
     size_t total = nmemb * size;
-    void *ptr = interleave_malloc(total);
+    void *ptr = interleave_malloc_with_flag(total, place_flag);
     
     if (likely(ptr)) {
         memset(ptr, 0, total);
@@ -686,10 +704,18 @@ void *interleave_realloc(void *ptr, size_t size)
         return NULL;
 
     if (ptr == NULL)
-        return interleave_malloc(size);
+        return interleave_malloc_with_flag(size, 1);
     
     if (size == 0) {
-        interleave_free(ptr);
+        // Free old memory
+        pthread_mutex_lock(&seg_lock);
+        struct addr_seg *seg = find_seg((unsigned long)ptr);
+        size_t old_size = seg ? seg_length(seg) : 0;
+        pthread_mutex_unlock(&seg_lock);
+        if (old_size > 0) {
+            check_seg((unsigned long)ptr, NULL);
+            libc_munmap(ptr, old_size);
+        }
         return NULL;
     }
     
@@ -697,6 +723,7 @@ void *interleave_realloc(void *ptr, size_t size)
     pthread_mutex_lock(&seg_lock);
     struct addr_seg *seg = find_seg((unsigned long)ptr);
     size_t old_size = seg ? seg_length(seg) : 0;
+    int old_place_flag = seg ? seg->place_flag : 1;
     pthread_mutex_unlock(&seg_lock);
     
     if (old_size == 0) {
@@ -704,69 +731,19 @@ void *interleave_realloc(void *ptr, size_t size)
         return libc_realloc(ptr, size);
     }
     
-    /* Allocate new memory */
-    void *new_ptr = interleave_malloc(size);
+    /* Allocate new memory with same place_flag */
+    void *new_ptr = interleave_malloc_with_flag(size, old_place_flag);
     if (!new_ptr)
         return NULL;
     
     /* Copy data */
     memcpy(new_ptr, ptr, old_size < size ? old_size : size);
     
-    /* Free old memory - need to clear seg first */
-    int is_interleaved = 0;
-    check_seg((unsigned long)ptr, &is_interleaved);
+    /* Free old memory */
+    check_seg((unsigned long)ptr, NULL);
     libc_munmap(ptr, old_size);
     
     return new_ptr;
-}
-
-void *interleave_aligned_alloc(size_t alignment, size_t size)
-{
-    ensure_mapping_funcs();
-    if (unlikely(!libc_mmap || !libc_munmap)) {
-        errno = ENOSYS;
-        return NULL;
-    }
-    if (unlikely(alignment == 0 || !is_pow2(alignment))) {
-        errno = EINVAL;
-        return NULL;
-    }
-    
-    /* Ensure alignment is at least PAGE_SIZE for interleaving to work correctly */
-    if (alignment < PAGE_SIZE)
-        alignment = PAGE_SIZE;
-    
-    /* For aligned allocation with interleaving, we need to ensure
-     * the base address is aligned */
-    size_t aligned_size = (size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-    size_t map_size = aligned_size + alignment;
-    
-    void *base = libc_mmap(NULL, map_size, PROT_READ | PROT_WRITE,
-                           MAP_PRIVATE | MAP_ANON, -1, 0);
-    if (base == MAP_FAILED)
-        return NULL;
-    
-    /* Find aligned address within the mapping */
-    uintptr_t base_addr = (uintptr_t)base;
-    uintptr_t aligned_addr = (base_addr + alignment - 1) & ~(alignment - 1);
-    void *aligned_ptr = (void *)aligned_addr;
-    
-    /* Unmap the unused portions */
-    if (aligned_addr > base_addr) {
-        libc_munmap(base, aligned_addr - base_addr);
-    }
-    size_t end_excess = (base_addr + map_size) - (aligned_addr + aligned_size);
-    if (end_excess > 0) {
-        libc_munmap((void *)(aligned_addr + aligned_size), end_excess);
-    }
-    
-    if (apply_interleave_policy(aligned_ptr, aligned_size) != 0) {
-        libc_munmap(aligned_ptr, aligned_size);
-        return NULL;
-    }
-
-    record_seg((unsigned long)aligned_ptr, aligned_size, 1);
-    return aligned_ptr;
 }
 
 void *aligned_alloc(size_t alignment, size_t size)
@@ -787,15 +764,14 @@ void *aligned_alloc(size_t alignment, size_t size)
         if (callchain_size_local >= 4) {
             uint64_t callstack_hash = compute_callstack_hash(callchain_strings_local, callchain_size_local, size);
             int pf = get_place_flag_by_hash(callstack_hash);
-            if (pf == 2) {
-                void *addr = haligned_alloc(alignment, size);
+            if (pf == 5 || pf == 0) {
+                void *addr = libc_aligned_alloc(alignment, size);
                 if (addr) {
-                    record_seg((unsigned long)addr, 0, 2);
+                    if (enable_madvise && pf == 5) madvise(addr, size, MADV_COLD);
                     return addr;
                 }
-                CXL_LOG("haligned_alloc failed, falling back to libc aligned_alloc");
-            } else if (pf == 1) {
-                void *addr = interleave_aligned_alloc(alignment, size);
+            } else if (pf >= 1 && pf <= 4) {
+                void *addr = interleave_aligned_alloc_with_flag(alignment, size, pf);
                 if (addr) {
                     return addr;
                 }
@@ -806,111 +782,17 @@ void *aligned_alloc(size_t alignment, size_t size)
     return libc_aligned_alloc(alignment, size);
 }
 
-int interleave_posix_memalign(void **memptr, size_t alignment, size_t sz)
+int interleave_posix_memalign_with_flag(void **memptr, size_t alignment, size_t sz, int place_flag)
 {
     if (!memptr || alignment < sizeof(void *) || alignment % sizeof(void *) || !is_pow2(alignment)) {
         return EINVAL;
     }
 
-    void *ptr = interleave_aligned_alloc(alignment, sz);
+    void *ptr = interleave_aligned_alloc_with_flag(alignment, sz, place_flag);
     if (!ptr) {
         return ENOMEM;
     }
 
     *memptr = ptr;
     return 0;
-}
-
-
-
-//Copy from hmsdk hmalloc.c
-void *hmmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset) {
-    void *new_addr = mmap(addr, length, prot, flags, fd, offset);
-    if (unlikely(new_addr == MAP_FAILED))
-        return MAP_FAILED;
-    unsigned long nodemask = (1UL << NUMA_LOCAL_NODE) | (1UL << NUMA_CXL_NODE);
-    unsigned long maxnode = sizeof(nodemask) * 8;
-    long ret = mbind(new_addr, length, MPOL_BIND, &nodemask, maxnode, 0);
-    if (unlikely(ret)) {
-        int mbind_errno = errno;
-        munmap(new_addr, length);
-        errno = mbind_errno;
-        return NULL;
-    }
-    
-    return new_addr;
-}
-
-int hmunmap(void *addr, size_t length) {
-    return munmap(addr, length);
-}
-
-void *hmalloc(size_t size) {
-    void *ptr;
-    ptr = mallocx(size, MALLOCX_ARENA(arena_index) | MALLOCX_TCACHE_NONE);
-    if (errno == ENOMEM)
-        return NULL;
-    return ptr;
-}
-
-void hfree(void *ptr) {
-    if (unlikely(ptr == NULL))
-        return;
-    dallocx(ptr, MALLOCX_ARENA(arena_index) | MALLOCX_TCACHE_NONE);
-}
-
-void *hcalloc(size_t nmemb, size_t size) {
-    void *ptr = hmalloc(nmemb * size);
-
-    if (likely(ptr))
-        memset(ptr, 0, nmemb * size);
-    return ptr;
-}
-
-void *hrealloc(void *ptr, size_t size) {
-    if (ptr == NULL)
-        return hmalloc(size);
-
-    if (size == 0) {
-        hfree(ptr);
-        return NULL;
-    }
-    return rallocx(ptr, size, MALLOCX_ARENA(arena_index) | MALLOCX_TCACHE_NONE);
-}
-
-void *haligned_alloc(size_t alignment, size_t size) {
-    /* NOTE: ptmalloc in glibc ignores all these checks unlike jemalloc */
-    if (unlikely(alignment == 0 || !is_pow2(alignment))) {
-        errno = EINVAL;
-        return NULL;
-    }
-
-    return mallocx(size,
-                   MALLOCX_ALIGN(alignment) | MALLOCX_ARENA(arena_index) | MALLOCX_TCACHE_NONE);
-}
-
-int hposix_memalign(void **memptr, size_t alignment, size_t size) {
-    int old_errno;
-    old_errno = errno;
-
-    if (unlikely(alignment == 0 || !is_pow2(alignment))) {
-        *memptr = NULL;
-        return EINVAL;
-    }
-
-    *memptr =
-        mallocx(size, MALLOCX_ALIGN(alignment) | MALLOCX_ARENA(arena_index) | MALLOCX_TCACHE_NONE);
-
-    if (unlikely(*memptr == NULL)) {
-        int ret = errno;
-        errno = old_errno;
-        return ret;
-    }
-    return 0;
-}
-
-size_t hmalloc_usable_size(void *ptr) {
-    if (unlikely(ptr == NULL))
-        return 0;
-    return sallocx(ptr, 0);
 }
