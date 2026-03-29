@@ -15,10 +15,10 @@
 #include <execinfo.h>
 #include <new>
 #include <errno.h> 
-#include <sys/types.h>
+#include <sys/stat.h>
 #include <numa.h>
 
-#define ARR_SIZE 950000000            /* Max number of malloc per core */
+#define ARR_SIZE 9500000 
 #define MAX_TID 512                /* Max number of tids to profile */
 
 #define USE_FRAME_POINTER   0      /* Use Frame Pointers to compute the stack trace (faster) */
@@ -91,15 +91,29 @@ static int (*libc_posix_memalign)(void **, size_t, size_t);
 
 FILE *open_file(int tid)
 {
-    char buff[125];
+    char buff[256];
+    char dir_buff[256];
     const char* prof_env = getenv("INSTRU_PROF_DIR");
     const char* prof_dir = prof_env ? prof_env : "/home/jz/instru_prof/";
-    sprintf(buff, "%sdata.raw.%d", prof_dir,tid);
+    
+    snprintf(dir_buff, sizeof(dir_buff), "%s", prof_dir);
+    char *p = dir_buff;
+    while (*p) {
+        if (*p == '/' && p != dir_buff) {
+            *p = '\0';
+            mkdir(dir_buff, 0755);
+            *p = '/';
+        }
+        p++;
+    }
+    mkdir(dir_buff, 0755);
+    
+    snprintf(buff, sizeof(buff), "%sdata.raw.%d", prof_dir, tid);
 
     FILE *dump = fopen(buff, "a+");
     if (!dump) {
-        fprintf(stderr, "open %s failed: %s (error code: %d)\n", buff, strerror(errno), errno);
-        exit(-1);
+        fprintf(stderr, "[MallocHook] open %s failed: %s (error code: %d)\n", buff, strerror(errno), errno);
+        return NULL; 
     }
     return dump;
 }
@@ -137,6 +151,10 @@ struct log *get_log()
     }
     if (!log_arr[tid_index])
         log_arr[tid_index] = (struct log*) libc_malloc(sizeof(*log_arr[tid_index]) * ARR_SIZE);
+    if (!log_arr[tid_index]) {
+        fprintf(stderr, "[MallocHook] Failed to allocate log array for tid_index=%d\n", tid_index);
+        return NULL;
+    }
     if (log_index[tid_index] >= ARR_SIZE)
         return NULL;
 
@@ -483,27 +501,39 @@ void __attribute__((destructor)) bye(void)
     for (i = 1; i < MAX_TID; i++) {
         if (tids[i] == 0)
             break;
+        if (!log_arr[i])
+            continue;
         FILE *file = open_file(tids[i]);
+        if (!file)
+            continue;
         for (j = 0; j < log_index[i]; j++) {
             struct log *l = &log_arr[i][j];
             _in_trace = 1;
             char **strings = backtrace_symbols(l->callchain_strings, l->callchain_size);
+            if (!strings) {
+                fprintf(file, "0x%016lx ", (unsigned long)l->callstack_hash);
+                fprintf(file, "backtrace_failed ");
+                fprintf(file, "%lu %lu %lx %d\n", l->rdt, (long unsigned)l->size,
+                (long unsigned)l->addr, (int)l->entry_type);
+                _in_trace = 0;
+                continue;
+            }
             if (l->callchain_size >= 4) {
                 fprintf(file, "0x%016lx ", (unsigned long)l->callstack_hash);
                 fprintf(file, "%s ", strings[3]);
-                fprintf(file, "%lu %lu %lx %d ", l->rdt, (long unsigned)l->size, 
+                fprintf(file, "%lu %lu %lx %d ", l->rdt, (long unsigned)l->size,
                 (long unsigned)l->addr, (int)l->entry_type);
 
                 Dl_info info;
                 // Try to get binary name and offset for addr2line
                 if (dladdr(l->callchain_strings[3], &info) && info.dli_fname) {
-                    fprintf(file, "%s:0x%lx \n", info.dli_fname, 
+                    fprintf(file, "%s:0x%lx \n", info.dli_fname,
                             (unsigned long)l->callchain_strings[3] - (unsigned long)info.dli_fbase);
                 }
             }else {
                 fprintf(file, "0x%016lx ", (unsigned long)l->callstack_hash);
                 fprintf(file, "unknown ");
-                fprintf(file, "%lu %lu %lx %d\n", l->rdt, (long unsigned)l->size, 
+                fprintf(file, "%lu %lu %lx %d\n", l->rdt, (long unsigned)l->size,
                 (long unsigned)l->addr, (int)l->entry_type);
             }
             libc_free(strings);
