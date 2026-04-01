@@ -96,6 +96,7 @@ FILE *open_file(int tid)
     const char* prof_env = getenv("INSTRU_PROF_DIR");
     const char* prof_dir = prof_env ? prof_env : "/home/jz/instru_prof/";
     
+      
     snprintf(dir_buff, sizeof(dir_buff), "%s", prof_dir);
     char *p = dir_buff;
     while (*p) {
@@ -159,7 +160,6 @@ struct log *get_log()
         return NULL;
 
     struct log *l = &log_arr[tid_index][log_index[tid_index]];
-    /* printf("%d %d \n", tid_index, (int)log_index[tid_index]); */
     log_index[tid_index]++;
     return l;
 }
@@ -221,6 +221,57 @@ static unsigned long get_symbol_offset(void *addr)
         return (unsigned long)addr - (unsigned long)info.dli_fbase;
     }
     return (unsigned long)addr;
+}
+
+static int is_unhelpful_symbol(const char *symbol)
+{
+    if (!symbol) {
+        return 1;
+    }
+    return strstr(symbol, "__libc_start_call_main") ||
+           strstr(symbol, "__libc_start_main") ||
+           strstr(symbol, "start_thread") ||
+           strstr(symbol, "clone") ||
+           strstr(symbol, "malloc_hook") ||
+           strstr(symbol, "libMallocHook") ||
+           strstr(symbol, "malloc(") ||
+           strstr(symbol, "calloc(") ||
+           strstr(symbol, "realloc(") ||
+           strstr(symbol, "operator new") ||
+           strstr(symbol, "_ZNSt15__new_allocator") ||
+           strstr(symbol, "_Znwm") ||
+           strstr(symbol, "_Znam");
+}
+
+static int choose_report_frame(void **callchain, char **symbols, size_t callchain_size)
+{
+    Dl_info info;
+    int fallback_main_exe = -1;
+    int fallback_any = -1;
+
+    for (size_t i = 0; i < callchain_size; i++) {
+        const char *symbol = symbols ? symbols[i] : NULL;
+        if (dladdr(callchain[i], &info) && info.dli_fbase) {
+            int is_shared = info.dli_fname && strstr(info.dli_fname, ".so");
+            if (!is_shared && fallback_main_exe < 0) {
+                fallback_main_exe = (int)i;
+            }
+            if (!is_shared && !is_unhelpful_symbol(symbol)) {
+                return (int)i;
+            }
+        }
+        if (fallback_any < 0 && symbol && !is_unhelpful_symbol(symbol)) {
+            fallback_any = (int)i;
+        }
+    }
+
+    if (fallback_main_exe >= 0) {
+        return fallback_main_exe;
+    }
+    if (fallback_any >= 0) {
+        return fallback_any;
+    }
+    return callchain_size >= 4 ? 3 : (callchain_size > 0 ? 0 : -1);
 }
 
 extern "C" void *malloc(size_t sz)
@@ -497,15 +548,31 @@ void __attribute__((destructor)) bye(void)
         return;
     bye_done = 1;
 
+    
     unsigned int i, j;
+    int files_written = 0;
+    int total_records = 0;
+    
     for (i = 1; i < MAX_TID; i++) {
         if (tids[i] == 0)
             break;
-        if (!log_arr[i])
+        if (!log_arr[i]) {
             continue;
+        }
+        
+        total_records += log_index[i];
+        
+        if (log_index[i] == 0) {
+            continue;
+        }
+        
         FILE *file = open_file(tids[i]);
-        if (!file)
+        if (!file) {
+            fprintf(stderr, "[MallocHook] Failed to open file for TID %d\n", tids[i]);
             continue;
+        }
+        
+        
         for (j = 0; j < log_index[i]; j++) {
             struct log *l = &log_arr[i][j];
             _in_trace = 1;
@@ -518,17 +585,18 @@ void __attribute__((destructor)) bye(void)
                 _in_trace = 0;
                 continue;
             }
-            if (l->callchain_size >= 4) {
+            int frame_idx = choose_report_frame(l->callchain_strings, strings, l->callchain_size);
+            if (frame_idx >= 0 && (size_t)frame_idx < l->callchain_size) {
                 fprintf(file, "0x%016lx ", (unsigned long)l->callstack_hash);
-                fprintf(file, "%s ", strings[3]);
+                fprintf(file, "%s ", strings[frame_idx]);
                 fprintf(file, "%lu %lu %lx %d ", l->rdt, (long unsigned)l->size,
                 (long unsigned)l->addr, (int)l->entry_type);
 
                 Dl_info info;
                 // Try to get binary name and offset for addr2line
-                if (dladdr(l->callchain_strings[3], &info) && info.dli_fname) {
+                if (dladdr(l->callchain_strings[frame_idx], &info) && info.dli_fname) {
                     fprintf(file, "%s:0x%lx \n", info.dli_fname,
-                            (unsigned long)l->callchain_strings[3] - (unsigned long)info.dli_fbase);
+                            (unsigned long)l->callchain_strings[frame_idx] - (unsigned long)info.dli_fbase);
                 }
             }else {
                 fprintf(file, "0x%016lx ", (unsigned long)l->callstack_hash);

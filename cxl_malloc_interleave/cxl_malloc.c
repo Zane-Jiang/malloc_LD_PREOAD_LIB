@@ -332,14 +332,14 @@ void *malloc(size_t sz)
 
     if (sz > INTERLEAVE_THRESHOLD) {
         void *addr;
-        size_t callchain_size_local = 0;
-        void *callchain_strings_local[CALLCHAIN_SIZE];
+        size_t callchain_size = 0;
+        void *callchain_strings[CALLCHAIN_SIZE];
 
         if (!_in_trace) {
-            get_trace(&callchain_size_local, callchain_strings_local);
+            get_trace(&callchain_size, callchain_strings);
         }
-        if (callchain_size_local >= 4) {
-            uint64_t callstack_hash = compute_callstack_hash(callchain_strings_local, callchain_size_local, sz);
+        if (callchain_size >= 4) {
+            uint64_t callstack_hash = compute_callstack_hash(callchain_strings, callchain_size, sz);
             int pf = get_place_flag_by_hash(callstack_hash);
             if (pf == 5 || pf == 0) {
                 addr = libc_malloc(sz);
@@ -374,14 +374,14 @@ void *calloc(size_t nmemb, size_t size)
     size_t total = nmemb * size;
 
     if (total > INTERLEAVE_THRESHOLD) {
-        size_t callchain_size_local = 0;
-        void *callchain_strings_local[CALLCHAIN_SIZE];
+        size_t callchain_size = 0;
+        void *callchain_strings[CALLCHAIN_SIZE];
 
         if (!_in_trace) {
-            get_trace(&callchain_size_local, callchain_strings_local);
+            get_trace(&callchain_size, callchain_strings);
         }
-        if (callchain_size_local >= 4) {
-            uint64_t callstack_hash = compute_callstack_hash(callchain_strings_local, callchain_size_local, total);
+        if (callchain_size >= 4) {
+            uint64_t callstack_hash = compute_callstack_hash(callchain_strings, callchain_size, total);
             int pf = get_place_flag_by_hash(callstack_hash);
             if (pf == 5 || pf == 0) {
                 void *addr = libc_calloc(nmemb, size);
@@ -436,14 +436,14 @@ void *memalign(size_t align, size_t sz)
         if (!libc_memalign) return NULL;
     }
     if (sz > INTERLEAVE_THRESHOLD) {
-        size_t callchain_size_local = 0;
-        void *callchain_strings_local[CALLCHAIN_SIZE];
+        size_t callchain_size = 0;
+        void *callchain_strings[CALLCHAIN_SIZE];
 
         if (!_in_trace) {
-            get_trace(&callchain_size_local, callchain_strings_local);
+            get_trace(&callchain_size, callchain_strings);
         }
-        if (callchain_size_local >= 4) {
-            uint64_t callstack_hash = compute_callstack_hash(callchain_strings_local, callchain_size_local, sz);
+        if (callchain_size >= 4) {
+            uint64_t callstack_hash = compute_callstack_hash(callchain_strings, callchain_size, sz);
             int pf = get_place_flag_by_hash(callstack_hash);
             if (pf == 5 || pf == 0) {
                 void *addr = libc_memalign(align, sz);
@@ -471,14 +471,14 @@ int posix_memalign(void **ptr, size_t align, size_t sz)
         if (!libc_posix_memalign) return ENOMEM;
     }
     if (sz > INTERLEAVE_THRESHOLD) {
-        size_t callchain_size_local = 0;
-        void *callchain_strings_local[CALLCHAIN_SIZE];
+        size_t callchain_size = 0;
+        void *callchain_strings[CALLCHAIN_SIZE];
 
         if (!_in_trace) {
-            get_trace(&callchain_size_local, callchain_strings_local);
+            get_trace(&callchain_size, callchain_strings);
         }
-        if (callchain_size_local >= 4) {
-            uint64_t callstack_hash = compute_callstack_hash(callchain_strings_local, callchain_size_local, sz);
+        if (callchain_size >= 4) {
+            uint64_t callstack_hash = compute_callstack_hash(callchain_strings, callchain_size, sz);
             int pf = get_place_flag_by_hash(callstack_hash);
             if (pf == 5 || pf == 0) {
                 int ret = libc_posix_memalign(ptr, align, sz);
@@ -756,13 +756,13 @@ void *aligned_alloc(size_t alignment, size_t size)
         }
     }
     if (size > INTERLEAVE_THRESHOLD) {
-        size_t callchain_size_local = 0;
-        void *callchain_strings_local[CALLCHAIN_SIZE];
+        size_t callchain_size = 0;
+        void *callchain_strings[CALLCHAIN_SIZE];
         if (!_in_trace) {
-            get_trace(&callchain_size_local, callchain_strings_local);
+            get_trace(&callchain_size, callchain_strings);
         }
-        if (callchain_size_local >= 4) {
-            uint64_t callstack_hash = compute_callstack_hash(callchain_strings_local, callchain_size_local, size);
+        if (callchain_size >= 4) {
+            uint64_t callstack_hash = compute_callstack_hash(callchain_strings, callchain_size, size);
             int pf = get_place_flag_by_hash(callstack_hash);
             if (pf == 5 || pf == 0) {
                 void *addr = libc_aligned_alloc(alignment, size);
