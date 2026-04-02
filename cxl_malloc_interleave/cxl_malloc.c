@@ -697,6 +697,69 @@ void *interleave_calloc_with_flag(size_t nmemb, size_t size, int place_flag)
     return ptr;
 }
 
+/*
+ * interleave_aligned_alloc_with_flag: allocates aligned memory with interleave policy
+ */
+void *interleave_aligned_alloc_with_flag(size_t alignment, size_t size, int place_flag)
+{
+    ensure_mapping_funcs();
+    if (unlikely(!libc_mmap || !libc_munmap)) {
+        errno = ENOSYS;
+        return NULL;
+    }
+
+    // Validate alignment (must be power of 2 and multiple of sizeof(void*))
+    if (alignment < sizeof(void *) || (alignment & (alignment - 1)) != 0) {
+        errno = EINVAL;
+        return NULL;
+    }
+
+    // Apply the appropriate interleave weights for this place_flag
+    if (place_flag >= 1 && place_flag <= 4) {
+        apply_interleave_weights_for_flag(place_flag);
+    }
+
+    /* Allocate a contiguous virtual memory region with alignment */
+    size_t aligned_size = (size + alignment - 1) & ~(alignment - 1);
+    if (aligned_size < size) { // Overflow check
+        errno = ENOMEM;
+        return NULL;
+    }
+
+    // Add padding for alignment
+    size_t alloc_size = aligned_size + alignment;
+    
+    void *base = libc_mmap(NULL, alloc_size, PROT_READ | PROT_WRITE, 
+                           MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (base == MAP_FAILED) {
+        return NULL;
+    }
+
+    // Calculate aligned address
+    uintptr_t base_addr = (uintptr_t)base;
+    uintptr_t aligned_addr = (base_addr + alignment - 1) & ~(alignment - 1);
+    void *ptr = (void *)aligned_addr;
+
+    // Calculate offset and unmap unused regions
+    size_t offset = aligned_addr - base_addr;
+    if (offset > 0) {
+        libc_munmap(base, offset);
+    }
+    
+    size_t tail = alloc_size - offset - aligned_size;
+    if (tail > 0) {
+        libc_munmap((void *)(aligned_addr + aligned_size), tail);
+    }
+
+    if (apply_interleave_policy(ptr, aligned_size, place_flag) != 0) {
+        libc_munmap(ptr, aligned_size);
+        return NULL;
+    }
+
+    record_seg((unsigned long)ptr, aligned_size, place_flag);
+    return ptr;
+}
+
 void *interleave_realloc(void *ptr, size_t size)
 {
     ensure_mapping_funcs();
