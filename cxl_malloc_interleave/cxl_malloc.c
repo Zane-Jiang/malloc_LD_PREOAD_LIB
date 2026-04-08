@@ -54,6 +54,7 @@ static int enable_madvise = 1;  /* Controls whether madvise is enabled (default:
 static int interleave_node0_weights[6] = {0, 5, 4, 3, 2, 0};
 static int interleave_node1_weights[6] = {0, 1, 1, 1, 1, 0};
 static int current_interleave_flag = -1;
+static int fixed_interleave_mode = 0;
 static pthread_mutex_t interleave_cfg_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static int parse_ratio_pair(const char *s, int *a, int *b)
@@ -99,6 +100,10 @@ static int write_int_to_sysfs(const char *path, int value)
 static int apply_interleave_weights_for_flag(int place_flag)
 {
     if (place_flag < 1 || place_flag > 4) {
+        return 0;
+    }
+    if (fixed_interleave_mode) {
+        current_interleave_flag = place_flag;
         return 0;
     }
     if (current_interleave_flag == place_flag) {
@@ -208,12 +213,21 @@ static uint64_t compute_callstack_hash(void **callchain, size_t size, size_t all
 // Based on hash value, determine placement (0/1/2)
 static inline int get_place_flag_by_hash(uint64_t hash)
 {
-    if (hash == 0) return 0;
+    static uint64_t total_matched = 0;
+    static uint64_t total_unmatched = 0;
+
+    if (hash == 0){
+        CXL_LOG("hash == 0");
+        return 0;
+    }
     for (int i = 0; i < obj_count; i++) {
         if (obj_hashes[i] == hash) {
+            total_matched++;
             return obj_place_flags[i];
         }
     }
+    total_unmatched++;
+    CXL_LOG("not find var hash : %ld (matched: %lu, unmatched: %lu)", hash, total_matched, total_unmatched);
     return 0;
 }
 
@@ -552,6 +566,11 @@ __attribute__((constructor)) void m_init(void) {
     if (enable_madvise_env) {
         enable_madvise = (atoi(enable_madvise_env) != 0) ? 1 : 0;
         CXL_LOG("CXL_MALLOC_ENABLE_MADVISE=%d", enable_madvise);
+    }
+    const char *fixed_interleave_env = getenv("CXL_MALLOC_FIXED_INTERLEAVE");
+    if (fixed_interleave_env) {
+        fixed_interleave_mode = (atoi(fixed_interleave_env) != 0) ? 1 : 0;
+        CXL_LOG("CXL_MALLOC_FIXED_INTERLEAVE=%d", fixed_interleave_mode);
     }
     libc_malloc = (void * (*)(size_t))dlsym(RTLD_NEXT, "malloc");
     libc_realloc = (void * (*)(void *, size_t))dlsym(RTLD_NEXT, "realloc");
