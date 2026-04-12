@@ -243,6 +243,72 @@ static int is_unhelpful_symbol(const char *symbol)
            strstr(symbol, "_Znam");
 }
 
+static int is_system_alloc_symbol(const char *symbol)
+{
+    if (!symbol) {
+        return 0;
+    }
+    return strstr(symbol, "malloc") ||
+           strstr(symbol, "calloc") ||
+           strstr(symbol, "realloc") ||
+           strstr(symbol, "free") ||
+           strstr(symbol, "memalign") ||
+           strstr(symbol, "posix_memalign") ||
+           strstr(symbol, "mmap") ||
+           strstr(symbol, "munmap") ||
+           strstr(symbol, "brk") ||
+           strstr(symbol, "_int_malloc") ||
+           strstr(symbol, "_int_free") ||
+           strstr(symbol, "sysmalloc") ||
+           strstr(symbol, "tcache") ||
+           strstr(symbol, "operator new") ||
+           strstr(symbol, "_Znwm") ||
+           strstr(symbol, "_Znam");
+}
+
+static int is_system_or_kernel_file(const char *file)
+{
+    if (!file) {
+        return 0;
+    }
+    return strstr(file, "libc.so") ||
+           strstr(file, "ld-linux") ||
+           strstr(file, "linux-vdso") ||
+           strstr(file, "[vdso]") ||
+           strstr(file, "[vsyscall]") ||
+           strstr(file, "[kernel]");
+}
+
+static int is_system_only_allocation(void **callchain, char **symbols, size_t callchain_size)
+{
+    Dl_info info;
+    int seen_frame = 0;
+
+    for (size_t i = 0; i < callchain_size; i++) {
+        const char *symbol = symbols ? symbols[i] : NULL;
+        const char *file = NULL;
+
+        if (dladdr(callchain[i], &info) && info.dli_fname) {
+            file = info.dli_fname;
+            seen_frame = 1;
+        }
+
+        if (!symbol) {
+            continue;
+        }
+
+        if (!is_system_alloc_symbol(symbol)) {
+            return 0;
+        }
+
+        if (file && !is_system_or_kernel_file(file)) {
+            return 0;
+        }
+    }
+
+    return seen_frame;
+}
+
 static int choose_report_frame(void **callchain, char **symbols, size_t callchain_size)
 {
     Dl_info info;
@@ -541,6 +607,7 @@ extern "C" int munmap(void *start, size_t length)
 }
 
 int __thread bye_done = 0;
+static int filter_system_malloc = 1;  
 
 void __attribute__((destructor)) bye(void)
 {
@@ -573,6 +640,7 @@ void __attribute__((destructor)) bye(void)
         }
         
         
+        int skipped_system_only = 0;
         for (j = 0; j < log_index[i]; j++) {
             struct log *l = &log_arr[i][j];
             _in_trace = 1;
@@ -585,6 +653,16 @@ void __attribute__((destructor)) bye(void)
                 _in_trace = 0;
                 continue;
             }
+            
+            if (filter_system_malloc) {
+                if (is_system_only_allocation(l->callchain_strings, strings, l->callchain_size)) {
+                    libc_free(strings);
+                    _in_trace = 0;
+                    skipped_system_only++;
+                    continue;
+                }
+            }
+            
             int frame_idx = choose_report_frame(l->callchain_strings, strings, l->callchain_size);
             if (frame_idx >= 0 && (size_t)frame_idx < l->callchain_size) {
                 fprintf(file, "0x%016lx ", (unsigned long)l->callstack_hash);
@@ -606,6 +684,10 @@ void __attribute__((destructor)) bye(void)
             }
             libc_free(strings);
 
+        }
+        if (filter_system_malloc && skipped_system_only > 0) {
+            fprintf(stderr, "[MallocHook] TID %d: skipped %d system-only allocations\n", 
+                    tids[i], skipped_system_only);
         }
         fclose(file);
     }
