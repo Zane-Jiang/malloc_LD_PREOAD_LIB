@@ -180,54 +180,61 @@ static uint64_t fnv1a_hash(const unsigned char *data, size_t len)
 }
 
 // Compute deterministic callstack hash (based on offsets, not runtime addresses)
+// Returns 0 when no main-binary frames found (library-only allocation).
 static uint64_t compute_callstack_hash(void **callchain, size_t size, size_t alloc_size)
 {
     unsigned long offsets[CALLCHAIN_SIZE];
     Dl_info info;
     size_t offset_count = 0;
-    
+
     for (size_t i = 0; i < size && i < CALLCHAIN_SIZE; i++) {
         if (dladdr(callchain[i], &info) && info.dli_fbase) {
             // Skip shared library frames (only hash main program frames)
             if (info.dli_fname && strstr(info.dli_fname, ".so")) {
                 continue;
             }
-            // Use offset relative to library base (deterministic)
+            // Use offset relative to binary base (deterministic across runs)
             offsets[offset_count++] = (unsigned long)callchain[i] - (unsigned long)info.dli_fbase;
         }
     }
-    
+
+    // No main-binary frames → library-only allocation, skip hash lookup
     if (offset_count == 0) {
-        return fnv1a_hash((const unsigned char *)&alloc_size, sizeof(alloc_size));
+        return 0;
     }
-    
-    // Compute hash of offsets first
+
     uint64_t hash = fnv1a_hash((const unsigned char *)offsets, offset_count * sizeof(unsigned long));
-    
     hash ^= alloc_size;
-    hash *= FNV_PRIME; // FNV prime
-    
+    hash *= FNV_PRIME;
     return hash;
 }
 
-// Based on hash value, determine placement (0/1/2)
+// Based on hash value, determine placement flag.
+// Returns 0 (DRAM default) when hash is 0 or not found.
 static inline int get_place_flag_by_hash(uint64_t hash)
 {
     static uint64_t total_matched = 0;
     static uint64_t total_unmatched = 0;
 
-    if (hash == 0){
-        CXL_LOG("hash == 0");
-        return 0;
+    if (hash == 0) {
+        return 0;  // library-only allocation, skip lookup
     }
     for (int i = 0; i < obj_count; i++) {
         if (obj_hashes[i] == hash) {
             total_matched++;
+            CXL_LOG("matched hash 0x%016lx -> place_flag=%d (matched: %lu)",
+                    (unsigned long)hash, obj_place_flags[i], total_matched);
             return obj_place_flags[i];
         }
     }
     total_unmatched++;
-    CXL_LOG("not find var hash : %ld (matched: %lu, unmatched: %lu)", hash, total_matched, total_unmatched);
+    if (total_unmatched <= 20) {
+        CXL_LOG("not find var hash : 0x%016lx (matched: %lu, unmatched: %lu)",
+                (unsigned long)hash, total_matched, total_unmatched);
+        if (total_unmatched == 20) {
+            CXL_LOG("(suppressing further 'not find' messages)");
+        }
+    }
     return 0;
 }
 
@@ -634,6 +641,10 @@ __attribute__((constructor)) void m_init(void) {
         obj_count++;
     }
     fclose(file);
+    CXL_LOG("Loaded %d entries from rank file: %s", obj_count, filename);
+    for (int i = 0; i < obj_count && i < 5; i++) {
+        CXL_LOG("  obj_hashes[%d] = 0x%016lx  place_flag=%d", i, obj_hashes[i], obj_place_flags[i]);
+    }
 }
  
 /*

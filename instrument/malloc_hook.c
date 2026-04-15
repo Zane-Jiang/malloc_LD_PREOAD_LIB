@@ -175,12 +175,14 @@ static uint64_t fnv1a_hash(const unsigned char *data, size_t len)
     return hash;
 }
 
+// Compute deterministic callstack hash (based on offsets, not runtime addresses).
+// Returns 0 when no main-binary frames found (library-only allocation).
 static uint64_t compute_callstack_hash(void **callchain, size_t callchain_size, size_t alloc_size)
 {
     unsigned long offsets[CALLCHAIN_SIZE];
     Dl_info info;
     size_t offset_count = 0;
-    
+
     for (size_t i = 0; i < callchain_size && i < CALLCHAIN_SIZE; i++) {
         if (dladdr(callchain[i], &info) && info.dli_fbase) {
             // Skip shared library frames (only hash main program frames)
@@ -190,15 +192,15 @@ static uint64_t compute_callstack_hash(void **callchain, size_t callchain_size, 
             offsets[offset_count++] = (unsigned long)callchain[i] - (unsigned long)info.dli_fbase;
         }
     }
-    
+
+    // No main-binary frames → library-only allocation
     if (offset_count == 0) {
-        return fnv1a_hash((const unsigned char *)&alloc_size, sizeof(alloc_size));
+        return 0;
     }
-    
+
     uint64_t hash = fnv1a_hash((const unsigned char *)offsets, offset_count * sizeof(unsigned long));
     hash ^= alloc_size;
     hash *= FNV_PRIME;
-    
     return hash;
 }
 
@@ -709,7 +711,33 @@ void __attribute__((constructor)) m_init(void)
     libc_mmap64 = (void * ( *)(void *, size_t, int, int, int, off_t))dlsym(RTLD_NEXT, "mmap64");
     libc_memalign = (void * ( *)(size_t, size_t))dlsym(RTLD_NEXT, "memalign");
     libc_posix_memalign = (int ( *)(void **, size_t, size_t))dlsym(RTLD_NEXT, "posix_memalign");
-    
+
+    /* Write TSC <-> CLOCK_MONOTONIC calibration anchor so Python can convert
+     * rdtsc cycle timestamps to the same nanosecond domain as perf record.
+     * File format: tsc_anchor=<cycles> mono_ns_anchor=<ns>
+     */
+    {
+        const char* prof_env = getenv("INSTRU_PROF_DIR");
+        const char* prof_dir = prof_env ? prof_env : "/home/jz/instru_prof/";
+        char calib_path[512];
+        snprintf(calib_path, sizeof(calib_path), "%stsc_calibration.txt", prof_dir);
+        FILE *calib = fopen(calib_path, "w");
+        if (calib) {
+            struct timespec ts1, ts2;
+            uint64_t tsc1, tsc2;
+            clock_gettime(CLOCK_MONOTONIC, &ts1);
+            rdtscll(tsc1);
+            clock_gettime(CLOCK_MONOTONIC, &ts2);
+            rdtscll(tsc2);
+            /* Use midpoints to minimise the read-order skew */
+            uint64_t mono_ns = ((uint64_t)ts1.tv_sec * 1000000000ULL + ts1.tv_nsec +
+                                (uint64_t)ts2.tv_sec * 1000000000ULL + ts2.tv_nsec) / 2;
+            uint64_t tsc_anchor = (tsc1 + tsc2) / 2;
+            fprintf(calib, "tsc_anchor=%lu\nmono_ns_anchor=%lu\n", tsc_anchor, mono_ns);
+            fclose(calib);
+        }
+    }
+
     in_init = 0;
     init_done = 1;
 }
