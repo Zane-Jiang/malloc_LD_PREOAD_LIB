@@ -1,7 +1,7 @@
 SRCS := cxl_malloc.c 
 OBJS := $(SRCS:.c=.o)
 
-CFLAGS=-Wall -g -ggdb3 -O0 -lnuma 
+CFLAGS=-Wall -g -ggdb3 -O2 -lnuma 
 LIB_DIR = ../lib
 .PHONY: all clean
 all: makefile.dep libCXLMalloc.so

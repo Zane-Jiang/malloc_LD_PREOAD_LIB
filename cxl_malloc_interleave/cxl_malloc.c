@@ -24,6 +24,42 @@
 #include <errno.h>
 #include <limits.h>
 #include <numaif.h>
+#include <fcntl.h>
+#include <sys/types.h>
+#include <sys/syscall.h>
+
+/*
+ * New kernel interface: set_mempolicy2 / mbind2 (kernel >= 6.17-per_object_interleave).
+ * These syscalls embed il_weights directly in the call, eliminating:
+ *   - sysfs write-based weight configuration (global shared state, 2 syscalls)
+ *   - the global interleave_cfg_lock mutex (serialization bottleneck)
+ * Each mbind2 call is fully independent and thread-safe.
+ */
+#ifndef __NR_set_mempolicy2
+#define __NR_set_mempolicy2  470
+#endif
+#ifndef __NR_mbind2
+#define __NR_mbind2          471
+#endif
+
+/*
+ * struct mempolicy_args: extensible argument struct for set_mempolicy2 / mbind2.
+ * Mirrors the RUNNING kernel's uapi (6.17.0Soar-adv_migrate-per_object_interleave+).
+ * NOTE: MEMPOLICY_ARGS_SIZE_VER0 == 40, so the struct must be exactly 40 bytes.
+ * The kernel's binary includes il_phase_offset as an additional field beyond
+ * what is visible in the installed mempolicy.h header.
+ */
+struct mempolicy_args {
+    __u16   mode;
+    __u16   mode_flags;
+    __s32   home_node;
+    __u64   pol_maxnode;
+    __u64   pol_nodes;        /* __user pointer to unsigned long nodemask */
+    __u64   il_weights;       /* __user pointer to __u8 per-node weight array, or 0 */
+    __u64   il_phase_offset;  /* interleave phase offset (0 = default) */
+};
+
+#define MEMPOLICY_ARGS_SIZE_VER0 40  /* sizeof first published struct, matches kernel check */
 
 #define MADV_NOMIGRATE 26
 
@@ -49,13 +85,53 @@ static int obj_place_flags[MAX_HASH_ENTRIES];          // 0: local, 1..4: interl
 static long long obj_heate_cnts[MAX_HASH_ENTRIES];     // optional
 static double obj_bw_scores[MAX_HASH_ENTRIES];         // optional
 static int obj_count = 0;
+
+struct hash_entry {
+    uint64_t hash;
+    int place_flag;
+};
+
+static struct hash_entry sorted_entries[MAX_HASH_ENTRIES];
+static int sorted_count = 0;
+
 static int enable_madvise = 1;  /* Controls whether madvise is enabled (default: enabled) */
 
 static int interleave_node0_weights[6] = {0, 5, 4, 3, 2, 0};
 static int interleave_node1_weights[6] = {0, 1, 1, 1, 1, 0};
-static int current_interleave_flag = -1;
 static int fixed_interleave_mode = 0;
+
+/*
+ * mbind2 availability probe.
+ *   0  = not probed yet
+ *   1  = available (use mbind2 fast path)
+ *  -1  = ENOSYS, fall back to sysfs+mbind
+ */
+static int mbind2_available = 0;
+static pthread_once_t mbind2_probe_once = PTHREAD_ONCE_INIT;
+
+/*
+ * Optional thread-policy pre-arm.
+ *
+ * Default is disabled because this allocator uses anonymous mmap without
+ * MAP_POPULATE, so physical pages are typically faulted only after mbind2 has
+ * already installed the VMA policy. In that common case, pre-arming the thread
+ * policy adds two extra syscalls (set_mempolicy2 + restore) without changing
+ * placement, and it hurts allocation-heavy multi-thread benchmarks.
+ *
+ * Keep it as an opt-in knob for experiments or future paths that may populate
+ * pages before mbind2 completes.
+ */
+static int prearm_thread_policy = 0;
+static __thread int tl_setpol2_ok = 1;  /* assume available until proven wrong */
+
+/* Legacy sysfs state (used only when mbind2 is unavailable) */
 static pthread_mutex_t interleave_cfg_lock = PTHREAD_MUTEX_INITIALIZER;
+static const char *weighted_interleave_node0_path = "/sys/kernel/mm/mempolicy/weighted_interleave/node0";
+static const char *weighted_interleave_node1_path = "/sys/kernel/mm/mempolicy/weighted_interleave/node1";
+static int weighted_interleave_node0_fd = -1;
+static int weighted_interleave_node1_fd = -1;
+static int current_weight_node0 = -1;
+static int current_weight_node1 = -1;
 
 static int parse_ratio_pair(const char *s, int *a, int *b)
 {
@@ -88,54 +164,334 @@ static void load_interleave_ratio_env(void)
     }
 }
 
-static int write_int_to_sysfs(const char *path, int value)
+static int open_weight_sysfs_fd(const char *path)
 {
-    FILE *fp = fopen(path, "w");
-    if (!fp) return -1;
-    int ret = fprintf(fp, "%d", value);
-    fclose(fp);
-    return (ret > 0) ? 0 : -1;
+    int fd = open(path, O_WRONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    return fd;
 }
 
-static int apply_interleave_weights_for_flag(int place_flag)
+static void init_weight_sysfs_fds(void)
+{
+    if (weighted_interleave_node0_fd < 0) {
+        weighted_interleave_node0_fd = open_weight_sysfs_fd(weighted_interleave_node0_path);
+    }
+    if (weighted_interleave_node1_fd < 0) {
+        weighted_interleave_node1_fd = open_weight_sysfs_fd(weighted_interleave_node1_path);
+    }
+}
+
+static int write_int_to_fd(int fd, int value)
+{
+    if (fd < 0) return -1;
+
+    char buf[16];
+    int len = snprintf(buf, sizeof(buf), "%d", value);
+    ssize_t written = pwrite(fd, buf, len, 0);
+    return (written == len) ? 0 : -1;
+}
+
+static int write_int_to_sysfs(const char *path, int value)
+{
+    int fd = open_weight_sysfs_fd(path);
+    if (fd < 0) return -1;
+    int ret = write_int_to_fd(fd, value);
+    close(fd);
+    return ret;
+}
+
+static int write_weight_pair(int w0, int w1)
+{
+    init_weight_sysfs_fds();
+
+    int ok0;
+    int ok1;
+    if (weighted_interleave_node0_fd >= 0 && weighted_interleave_node1_fd >= 0) {
+        ok0 = write_int_to_fd(weighted_interleave_node0_fd, w0);
+        ok1 = write_int_to_fd(weighted_interleave_node1_fd, w1);
+    } else {
+        ok0 = write_int_to_sysfs(weighted_interleave_node0_path, w0);
+        ok1 = write_int_to_sysfs(weighted_interleave_node1_path, w1);
+    }
+    return (ok0 == 0 && ok1 == 0) ? 0 : -1;
+}
+
+static int hash_entry_cmp(const void *a, const void *b)
+{
+    const struct hash_entry *ea = (const struct hash_entry *)a;
+    const struct hash_entry *eb = (const struct hash_entry *)b;
+    return (ea->hash > eb->hash) - (ea->hash < eb->hash);
+}
+
+static int prepare_interleave_weights_for_flag_locked(int place_flag)
 {
     if (place_flag < 1 || place_flag > 4) {
         return 0;
     }
     if (fixed_interleave_mode) {
-        current_interleave_flag = place_flag;
-        return 0;
-    }
-    if (current_interleave_flag == place_flag) {
         return 0;
     }
 
+    int w0 = interleave_node0_weights[place_flag];
+    int w1 = interleave_node1_weights[place_flag];
+    if (current_weight_node0 == w0 && current_weight_node1 == w1) {
+        return 0;
+    }
+
+    if (write_weight_pair(w0, w1) == 0) {
+        current_weight_node0 = w0;
+        current_weight_node1 = w1;
+        return 0;
+    }
+
+    CXL_LOG("set weighted interleave failed for flag=%d (%d:%d), errno=%d", place_flag, w0, w1, errno);
+    return -1;
+}
+
+/*
+ * Legacy policy path: sysfs weight write + mbind (requires global mutex).
+ * Used only when mbind2 is unavailable (ENOSYS on older kernels).
+ */
+static int create_weighted_interleave_policy_sysfs(void *addr, size_t len, int place_flag)
+{
+    unsigned long nodemask = (1UL << NUMA_LOCAL_NODE) | (1UL << NUMA_CXL_NODE);
+    unsigned long maxnode = sizeof(nodemask) * 8;
+
     pthread_mutex_lock(&interleave_cfg_lock);
-    if (current_interleave_flag != place_flag) {
-        int w0 = interleave_node0_weights[place_flag];
-        int w1 = interleave_node1_weights[place_flag];
-        int ok0 = write_int_to_sysfs("/sys/kernel/mm/mempolicy/weighted_interleave/node0", w0);
-        int ok1 = write_int_to_sysfs("/sys/kernel/mm/mempolicy/weighted_interleave/node1", w1);
-        if (ok0 == 0 && ok1 == 0) {
-               current_interleave_flag = place_flag;
-        } else {
-            CXL_LOG("set weighted interleave failed for flag=%d (%d:%d), errno=%d", place_flag, w0, w1, errno);
-            pthread_mutex_unlock(&interleave_cfg_lock);
+    int prep_rc = prepare_interleave_weights_for_flag_locked(place_flag);
+    if (prep_rc != 0) {
+        pthread_mutex_unlock(&interleave_cfg_lock);
+        return -1;
+    }
+
+    if (mbind(addr, len, MPOL_WEIGHTED_INTERLEAVE, &nodemask, maxnode, 0) != 0) {
+        CXL_LOG("mbind interleave failed: %s", strerror(errno));
+        pthread_mutex_unlock(&interleave_cfg_lock);
+        return -1;
+    }
+    pthread_mutex_unlock(&interleave_cfg_lock);
+
+    if (place_flag >= 3) {
+        if (madvise(addr, len, MADV_NOMIGRATE) != 0) {
+            CXL_LOG("madvise MADV_NOMIGRATE failed: %s", strerror(errno));
             return -1;
         }
     }
-    pthread_mutex_unlock(&interleave_cfg_lock);
     return 0;
 }
 
-struct addr_seg {
-    long unsigned start;
-    long unsigned end;
-    int place_flag;   // 0: libc, 1: interleave, 2: h-alloc
+/*
+ * Probe thread: try a dummy mbind2 with an obviously-invalid address so it
+ * fails with EFAULT (not ENOSYS) if the syscall exists.
+ */
+static void probe_mbind2(void)
+{
+    struct mempolicy_args probe_args = {
+        .mode       = MPOL_WEIGHTED_INTERLEAVE,
+        .mode_flags = 0,
+        .home_node  = -1,
+        .pol_maxnode = 0,
+        .pol_nodes  = 0,
+        .il_weights = 0,
+    };
+    long rc = syscall(__NR_mbind2, (unsigned long)0UL, (unsigned long)0UL,
+                      &probe_args, MEMPOLICY_ARGS_SIZE_VER0, (unsigned int)0);
+    if (rc == -1 && errno == ENOSYS) {
+        mbind2_available = -1;
+        CXL_LOG("mbind2 not available (ENOSYS), using legacy sysfs path");
+    } else {
+        /* Any other error (EINVAL, EFAULT, etc.) means the syscall exists. */
+        mbind2_available = 1;
+        CXL_LOG("mbind2 available: using lock-free inline-weight path");
+    }
+}
+
+/*
+ * Fast path: mbind2 with inline weights — no global mutex, no sysfs write.
+ *
+ * Academic rationale:
+ *   Old path serialises every interleave allocation on interleave_cfg_lock
+ *   because the kernel reads weighted-interleave weights from global sysfs
+ *   files at mbind() time. Two threads cannot update the sysfs weights
+ *   concurrently without corrupting each other's VMA policy.
+ *
+ *   mbind2 passes il_weights inline inside mempolicy_args. The kernel copies
+ *   them atomically into the new VMA's private mempolicy; no global sysfs
+ *   state is involved. Consequently:
+ *     1. The interleave_cfg_lock mutex is completely eliminated.
+ *     2. Two file-writes (costly sysfs kernel path) reduce to zero.
+ *     3. One syscall (mbind2) replaces three kernel operations.
+ *     4. Threads scale to allocate different-ratio objects in parallel.
+ */
+static int create_weighted_interleave_policy_mbind2(void *addr, size_t len, int place_flag)
+{
+    unsigned long nodemask = (1UL << NUMA_LOCAL_NODE) | (1UL << NUMA_CXL_NODE);
+    uint8_t weights[2] = {
+        (uint8_t)interleave_node0_weights[place_flag],
+        (uint8_t)(fixed_interleave_mode ? 0 : interleave_node1_weights[place_flag]),
+    };
+
+    struct mempolicy_args args = {
+        .mode           = MPOL_WEIGHTED_INTERLEAVE,
+        .mode_flags     = 0,
+        .home_node      = -1,
+        .pol_maxnode    = (uint64_t)(sizeof(unsigned long) * 8),
+        .pol_nodes      = (uint64_t)(uintptr_t)&nodemask,
+        /* fixed_interleave_mode: pass NULL so kernel uses sysfs weights */
+        .il_weights     = fixed_interleave_mode ? 0 :
+                          (uint64_t)(uintptr_t)weights,
+        .il_phase_offset = 0,
+    };
+
+    long rc = syscall(__NR_mbind2,
+                      (unsigned long)(uintptr_t)addr,
+                      (unsigned long)len,
+                      &args, MEMPOLICY_ARGS_SIZE_VER0,
+                      (unsigned int)0);
+    if (rc != 0) {
+        CXL_LOG("mbind2 failed for flag=%d: %s", place_flag, strerror(errno));
+        return -1;
+    }
+
+    if (enable_madvise && place_flag >= 3) {
+        if (madvise(addr, len, MADV_NOMIGRATE) != 0) {
+            CXL_LOG("madvise MADV_NOMIGRATE failed: %s", strerror(errno));
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/*
+ * Set the calling thread's mempolicy via set_mempolicy2 with inline weights.
+ *
+ * This path is intentionally opt-in. For the allocator's current plain mmap
+ * path, mbind2 alone is sufficient because page placement is decided on later
+ * faults after the VMA policy has already been installed.
+ */
+static void set_thread_interleave_policy(int place_flag)
+{
+     if (!prearm_thread_policy || !tl_setpol2_ok) return;
+
+    unsigned long nodemask = (1UL << NUMA_LOCAL_NODE) | (1UL << NUMA_CXL_NODE);
+    uint8_t weights[2] = {
+        (uint8_t)interleave_node0_weights[place_flag],
+        (uint8_t)interleave_node1_weights[place_flag],
+    };
+    struct mempolicy_args args = {
+        .mode           = MPOL_WEIGHTED_INTERLEAVE,
+        .mode_flags     = 0,
+        .home_node      = -1,
+        .pol_maxnode    = (uint64_t)(sizeof(unsigned long) * 8),
+        .pol_nodes      = (uint64_t)(uintptr_t)&nodemask,
+        .il_weights     = fixed_interleave_mode ? 0 :
+                          (uint64_t)(uintptr_t)weights,
+        .il_phase_offset = 0,
+    };
+    long rc = syscall(__NR_set_mempolicy2, &args, MEMPOLICY_ARGS_SIZE_VER0);
+    if (rc != 0 && errno == ENOSYS) {
+        tl_setpol2_ok = 0;  /* disable per-thread for this thread */
+    }
+}
+
+/*
+ * Restore calling thread's mempolicy to MPOL_DEFAULT after the mmap region
+ * has been bound with mbind2.  This prevents the thread-local WI policy from
+ * accidentally influencing subsequent non-interleave allocations.
+ */
+static void restore_thread_default_policy(void)
+{
+    if (!prearm_thread_policy || !tl_setpol2_ok) return;
+    struct mempolicy_args def = {
+        .mode           = MPOL_DEFAULT,
+        .mode_flags     = 0,
+        .home_node      = -1,
+        .pol_maxnode    = 0,
+        .pol_nodes      = 0,
+        .il_weights     = 0,
+        .il_phase_offset = 0,
+    };
+    (void)syscall(__NR_set_mempolicy2, &def, MEMPOLICY_ARGS_SIZE_VER0);
+}
+
+/*
+ * Unified entry point: dispatches to the mbind2 fast path or the legacy
+ * sysfs path depending on what the kernel supports.
+ */
+static int create_weighted_interleave_policy(void *addr, size_t len, int place_flag)
+{
+    if (place_flag < 1 || place_flag > 4) return 0;
+
+    if (mbind2_available == 0) {
+        pthread_once(&mbind2_probe_once, probe_mbind2);
+    }
+
+    if (mbind2_available == 1) {
+        if (prearm_thread_policy) {
+            set_thread_interleave_policy(place_flag);
+        }
+        int rc = create_weighted_interleave_policy_mbind2(addr, len, place_flag);
+        if (prearm_thread_policy) {
+            restore_thread_default_policy();
+        }
+        return rc;
+    }
+
+    /* Fallback: legacy sysfs + mbind (serialised via global mutex) */
+    return create_weighted_interleave_policy_sysfs(addr, len, place_flag);
+}
+
+/* ---- Hash table for tracking interleave allocations (O(1) lookup) ---- */
+#define SEG_HT_BITS     16
+#define SEG_HT_SIZE     (1 << SEG_HT_BITS)   /* 65536 slots */
+#define SEG_HT_MASK     (SEG_HT_SIZE - 1)
+#define SEG_SHARD_BITS  8
+#define SEG_SHARD_COUNT (1 << SEG_SHARD_BITS)
+#define SEG_SHARD_SIZE  (SEG_HT_SIZE / SEG_SHARD_COUNT)
+#define SEG_SHARD_MASK  (SEG_SHARD_COUNT - 1)
+#define SEG_SHARD_SLOT_MASK (SEG_SHARD_SIZE - 1)
+#define SEG_EMPTY       0UL
+#define SEG_TOMBSTONE   1UL   /* 1 is never a valid mmap address */
+
+struct seg_entry {
+    unsigned long addr;   /* SEG_EMPTY=free, SEG_TOMBSTONE=deleted */
+    size_t        size;
+    int           place_flag;
 };
+
+static struct seg_entry seg_ht[SEG_HT_SIZE];
 static int __thread _in_trace = 0;
-static struct addr_seg addr_segs[MAX_OBJECTS];
-static pthread_mutex_t seg_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t seg_locks[SEG_SHARD_COUNT];
+
+static inline unsigned int seg_hash(unsigned long a)
+{
+    /* mmap addresses are page-aligned; shift out the zero low bits */
+    a >>= 12;
+    a ^= a >> 16;
+    a *= 0x45d9f3bU;
+    a ^= a >> 16;
+    return (unsigned int)(a & SEG_HT_MASK);
+}
+
+static inline unsigned int seg_shard_id(unsigned int hash)
+{
+    return hash >> (SEG_HT_BITS - SEG_SHARD_BITS);
+}
+
+static inline unsigned int seg_shard_base(unsigned int shard_id)
+{
+    return shard_id * SEG_SHARD_SIZE;
+}
+
+static inline unsigned int seg_shard_offset(unsigned int hash)
+{
+    return hash & SEG_SHARD_SLOT_MASK;
+}
+
+static inline pthread_mutex_t *seg_lock_for_hash(unsigned int hash)
+{
+    return &seg_locks[seg_shard_id(hash) & SEG_SHARD_MASK];
+}
 #define CALLCHAIN_SIZE      10     /* stack trace length */
 
 
@@ -219,12 +575,19 @@ static inline int get_place_flag_by_hash(uint64_t hash)
     if (hash == 0) {
         return 0;  // library-only allocation, skip lookup
     }
-    for (int i = 0; i < obj_count; i++) {
-        if (obj_hashes[i] == hash) {
+    int lo = 0;
+    int hi = sorted_count - 1;
+    while (lo <= hi) {
+        int mid = lo + (hi - lo) / 2;
+        uint64_t mid_hash = sorted_entries[mid].hash;
+        if (mid_hash == hash) {
             total_matched++;
-            CXL_LOG("matched hash 0x%016lx -> place_flag=%d (matched: %lu)",
-                    (unsigned long)hash, obj_place_flags[i], total_matched);
-            return obj_place_flags[i];
+            return sorted_entries[mid].place_flag;
+        }
+        if (mid_hash < hash) {
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
         }
     }
     total_unmatched++;
@@ -238,43 +601,55 @@ static inline int get_place_flag_by_hash(uint64_t hash)
     return 0;
 }
 
-/* Record allocation segment */
+/* Record allocation segment — O(1) average via hash table */
 void record_seg(unsigned long addr, size_t size, int place_flag)
 {
-    pthread_mutex_lock(&seg_lock);
-    for (int i = 0; i < MAX_OBJECTS; i++) {
-        struct addr_seg *seg = &addr_segs[i];
-        if (seg->start == 0 && seg->end == 0) {
-            seg->start = addr;
-            seg->end = addr + size;
-            seg->place_flag = place_flag;
-            pthread_mutex_unlock(&seg_lock);
+    unsigned int hash = seg_hash(addr);
+    unsigned int shard_id = seg_shard_id(hash);
+    unsigned int base = seg_shard_base(shard_id);
+    unsigned int offset = seg_shard_offset(hash);
+
+    pthread_mutex_t *seg_lock = seg_lock_for_hash(hash);
+    pthread_mutex_lock(seg_lock);
+    for (unsigned int i = 0; i < SEG_SHARD_SIZE; i++) {
+        unsigned int pos = base + ((offset + i) & SEG_SHARD_SLOT_MASK);
+        unsigned long a = seg_ht[pos].addr;
+        if (a == SEG_EMPTY || a == SEG_TOMBSTONE) {
+            seg_ht[pos].addr = addr;
+            seg_ht[pos].size = size;
+            seg_ht[pos].place_flag = place_flag;
+            pthread_mutex_unlock(seg_lock);
             return;
         }
     }
-    pthread_mutex_unlock(&seg_lock);
-    CXL_LOG("Warning: addr_segs full, cannot record segment");
+    pthread_mutex_unlock(seg_lock);
+    CXL_LOG("Warning: seg shard %u full, cannot record segment", shard_id);
 }
 
-static struct addr_seg *find_seg(unsigned long addr)
+/* Find entry by address — O(1) average. Caller must hold the shard lock. */
+static struct seg_entry *find_seg(unsigned long addr)
 {
-    for (int i = 0; i < MAX_OBJECTS; ++i) {
-        if (addr_segs[i].start == addr)
-            return &addr_segs[i];
+    unsigned int hash = seg_hash(addr);
+    unsigned int base = seg_shard_base(seg_shard_id(hash));
+    unsigned int offset = seg_shard_offset(hash);
+
+    for (unsigned int i = 0; i < SEG_SHARD_SIZE; i++) {
+        unsigned int pos = base + ((offset + i) & SEG_SHARD_SLOT_MASK);
+        unsigned long a = seg_ht[pos].addr;
+        if (a == addr)
+            return &seg_ht[pos];
+        if (a == SEG_EMPTY)
+            return NULL;   /* not found — empty slot ends the probe chain */
+        /* skip tombstones */
     }
     return NULL;
 }
 
-static inline size_t seg_length(const struct addr_seg *seg)
-{
-    return seg ? (size_t)(seg->end - seg->start) : 0;
-}
-
-static inline void clear_seg(struct addr_seg *seg)
+static inline void clear_seg(struct seg_entry *seg)
 {
     if (seg) {
-        seg->start = 0;
-        seg->end = 0;
+        seg->addr = SEG_TOMBSTONE;
+        seg->size = 0;
         seg->place_flag = 0;
     }
 }
@@ -295,11 +670,13 @@ int get_trace(size_t *size, void **strings)
 
 size_t check_seg(unsigned long addr, int *place_flag)
 {
-    pthread_mutex_lock(&seg_lock);
-    struct addr_seg *seg = find_seg(addr);
+    unsigned int hash = seg_hash(addr);
+    pthread_mutex_t *seg_lock = seg_lock_for_hash(hash);
+    pthread_mutex_lock(seg_lock);
+    struct seg_entry *seg = find_seg(addr);
     size_t size_to_free = 0;
     if (seg) {
-        size_to_free = seg_length(seg);
+        size_to_free = seg->size;
         if (place_flag) {
             *place_flag = seg->place_flag;
         }
@@ -307,7 +684,7 @@ size_t check_seg(unsigned long addr, int *place_flag)
     } else if (place_flag) {
         *place_flag = 0;
     }
-    pthread_mutex_unlock(&seg_lock);
+    pthread_mutex_unlock(seg_lock);
     return size_to_free;
 }
 
@@ -323,15 +700,15 @@ size_t malloc_usable_size(void *ptr)
         }
     }
 
-    pthread_mutex_lock(&seg_lock);
-    struct addr_seg *seg = find_seg((unsigned long)ptr);
-    size_t sz = seg ? seg_length(seg) : 0;
-    pthread_mutex_unlock(&seg_lock);
+    unsigned int hash = seg_hash((unsigned long)ptr);
+    pthread_mutex_t *seg_lock = seg_lock_for_hash(hash);
+    pthread_mutex_lock(seg_lock);
+    struct seg_entry *seg = find_seg((unsigned long)ptr);
+    size_t sz = seg ? seg->size : 0;
+    pthread_mutex_unlock(seg_lock);
 
-    if (seg) {
-        if (sz > 0) {
-            return sz;
-        }
+    if (sz > 0) {
+        return sz;
     }
 
     return libc_malloc_usable_size(ptr);
@@ -437,11 +814,13 @@ void *realloc(void *ptr, size_t size)
         free(ptr);
         return NULL;
     }
-    
-    pthread_mutex_lock(&seg_lock);
-    struct addr_seg *seg = find_seg((unsigned long)ptr);
+
+    unsigned int hash = seg_hash((unsigned long)ptr);
+    pthread_mutex_t *seg_lock = seg_lock_for_hash(hash);
+    pthread_mutex_lock(seg_lock);
+    struct seg_entry *seg = find_seg((unsigned long)ptr);
     int pf = seg ? seg->place_flag : 0;
-    pthread_mutex_unlock(&seg_lock);
+    pthread_mutex_unlock(seg_lock);
     
     if (pf >= 1 && pf <= 4) {
         return interleave_realloc(ptr, size);
@@ -574,6 +953,11 @@ __attribute__((constructor)) void m_init(void) {
         enable_madvise = (atoi(enable_madvise_env) != 0) ? 1 : 0;
         CXL_LOG("CXL_MALLOC_ENABLE_MADVISE=%d", enable_madvise);
     }
+    const char *prearm_thread_policy_env = getenv("CXL_MALLOC_PREARM_THREAD_POLICY");
+    if (prearm_thread_policy_env) {
+        prearm_thread_policy = (atoi(prearm_thread_policy_env) != 0) ? 1 : 0;
+        CXL_LOG("CXL_MALLOC_PREARM_THREAD_POLICY=%d", prearm_thread_policy);
+    }
     const char *fixed_interleave_env = getenv("CXL_MALLOC_FIXED_INTERLEAVE");
     if (fixed_interleave_env) {
         fixed_interleave_mode = (atoi(fixed_interleave_env) != 0) ? 1 : 0;
@@ -589,6 +973,18 @@ __attribute__((constructor)) void m_init(void) {
     libc_memalign = (void * (*)(size_t, size_t))dlsym(RTLD_NEXT, "memalign");
     libc_posix_memalign = (int (*)(void **, size_t, size_t))dlsym(RTLD_NEXT, "posix_memalign");
     libc_aligned_alloc = (void * (*)(size_t, size_t))dlsym(RTLD_NEXT, "aligned_alloc");
+
+    for (int i = 0; i < SEG_SHARD_COUNT; i++) {
+        pthread_mutex_init(&seg_locks[i], NULL);
+    }
+
+    /* Probe mbind2 availability now so the first hot-path call is free. */
+    pthread_once(&mbind2_probe_once, probe_mbind2);
+
+    /* Open sysfs weight fds only when falling back to the legacy path. */
+    if (mbind2_available != 1) {
+        init_weight_sysfs_fds();
+    }
 
     load_interleave_ratio_env();
 
@@ -642,8 +1038,26 @@ __attribute__((constructor)) void m_init(void) {
     }
     fclose(file);
     CXL_LOG("Loaded %d entries from rank file: %s", obj_count, filename);
-    for (int i = 0; i < obj_count && i < 5; i++) {
-        CXL_LOG("  obj_hashes[%d] = 0x%016lx  place_flag=%d", i, obj_hashes[i], obj_place_flags[i]);
+    for (int i = 0; i < obj_count; i++) {
+        sorted_entries[i].hash = obj_hashes[i];
+        sorted_entries[i].place_flag = obj_place_flags[i];
+    }
+    sorted_count = obj_count;
+    qsort(sorted_entries, sorted_count, sizeof(sorted_entries[0]), hash_entry_cmp);
+}
+
+__attribute__((destructor)) static void m_fini(void)
+{
+    /* Close sysfs fds only when we actually opened them (legacy path). */
+    if (mbind2_available != 1) {
+        if (weighted_interleave_node0_fd >= 0) {
+            close(weighted_interleave_node0_fd);
+            weighted_interleave_node0_fd = -1;
+        }
+        if (weighted_interleave_node1_fd >= 0) {
+            close(weighted_interleave_node1_fd);
+            weighted_interleave_node1_fd = -1;
+        }
     }
 }
  
@@ -662,36 +1076,12 @@ void ensure_mapping_funcs(void)
 
 
 
-static int apply_interleave_policy(void *addr, size_t len, int place_flag)
-{
-    unsigned long nodemask = (1UL << NUMA_LOCAL_NODE) | (1UL << NUMA_CXL_NODE);
-    unsigned long maxnode = sizeof(nodemask) * 8;
-
-    if (mbind(addr, len, MPOL_WEIGHTED_INTERLEAVE, &nodemask, maxnode, MPOL_MF_MOVE) != 0) {
-        CXL_LOG("mbind interleave failed: %s", strerror(errno));
-        return -1;
-    }
-    // Only set MADV_NOMIGRATE for tier >= 3 
-    if (place_flag >= 3) {
-        if (madvise(addr, len, MADV_NOMIGRATE) != 0) {
-            CXL_LOG("madvise MADV_NOMIGRATE failed: %s", strerror(errno));
-            return -1;
-        }
-    }
-    return 0;
-}
-
 void *interleave_malloc_with_flag(size_t size, int place_flag)
 {
     ensure_mapping_funcs();
     if (unlikely(!libc_mmap || !libc_munmap)) {
         errno = ENOSYS;
         return NULL;
-    }
-
-    // Apply the appropriate interleave weights for this place_flag
-    if (place_flag >= 1 && place_flag <= 4) {
-        apply_interleave_weights_for_flag(place_flag);
     }
 
     /* Allocate a contiguous virtual memory region */
@@ -702,7 +1092,7 @@ void *interleave_malloc_with_flag(size_t size, int place_flag)
         return NULL;
     }
 
-    if (apply_interleave_policy(base, aligned_size, place_flag) != 0) {
+    if (create_weighted_interleave_policy(base, aligned_size, place_flag) != 0) {
         libc_munmap(base, aligned_size);
         return NULL;
     }
@@ -744,11 +1134,6 @@ void *interleave_aligned_alloc_with_flag(size_t alignment, size_t size, int plac
         return NULL;
     }
 
-    // Apply the appropriate interleave weights for this place_flag
-    if (place_flag >= 1 && place_flag <= 4) {
-        apply_interleave_weights_for_flag(place_flag);
-    }
-
     /* Allocate a contiguous virtual memory region with alignment */
     size_t aligned_size = (size + alignment - 1) & ~(alignment - 1);
     if (aligned_size < size) { // Overflow check
@@ -781,7 +1166,7 @@ void *interleave_aligned_alloc_with_flag(size_t alignment, size_t size, int plac
         libc_munmap((void *)(aligned_addr + aligned_size), tail);
     }
 
-    if (apply_interleave_policy(ptr, aligned_size, place_flag) != 0) {
+    if (create_weighted_interleave_policy(ptr, aligned_size, place_flag) != 0) {
         libc_munmap(ptr, aligned_size);
         return NULL;
     }
@@ -801,23 +1186,27 @@ void *interleave_realloc(void *ptr, size_t size)
     
     if (size == 0) {
         // Free old memory
-        pthread_mutex_lock(&seg_lock);
-        struct addr_seg *seg = find_seg((unsigned long)ptr);
-        size_t old_size = seg ? seg_length(seg) : 0;
-        pthread_mutex_unlock(&seg_lock);
+        unsigned int hash = seg_hash((unsigned long)ptr);
+        pthread_mutex_t *seg_lock = seg_lock_for_hash(hash);
+        pthread_mutex_lock(seg_lock);
+        struct seg_entry *seg = find_seg((unsigned long)ptr);
+        size_t old_size = seg ? seg->size : 0;
+        pthread_mutex_unlock(seg_lock);
         if (old_size > 0) {
             check_seg((unsigned long)ptr, NULL);
             libc_munmap(ptr, old_size);
         }
         return NULL;
     }
-    
+
     /* Find old size */
-    pthread_mutex_lock(&seg_lock);
-    struct addr_seg *seg = find_seg((unsigned long)ptr);
-    size_t old_size = seg ? seg_length(seg) : 0;
+    unsigned int hash = seg_hash((unsigned long)ptr);
+    pthread_mutex_t *seg_lock = seg_lock_for_hash(hash);
+    pthread_mutex_lock(seg_lock);
+    struct seg_entry *seg = find_seg((unsigned long)ptr);
+    size_t old_size = seg ? seg->size : 0;
     int old_place_flag = seg ? seg->place_flag : 1;
-    pthread_mutex_unlock(&seg_lock);
+    pthread_mutex_unlock(seg_lock);
     
     if (old_size == 0) {
         /* Not our allocation */
