@@ -80,6 +80,7 @@ struct mempolicy_args {
 #define MAX_OBJECTS          30000
 #define INTERLEAVE_THRESHOLD 4096  /* Minimum size for interleave allocation */
 #define MAX_HASH_ENTRIES 1000
+static size_t interleave_min_size = 65536;  /* no-THP default: skip mmap/mbind2 for medium allocations */
 static uint64_t obj_hashes[MAX_HASH_ENTRIES];
 static int obj_place_flags[MAX_HASH_ENTRIES];          // 0: local, 1..4: interleave tiers, 5: CXL cold
 static long long obj_heate_cnts[MAX_HASH_ENTRIES];     // optional
@@ -601,6 +602,11 @@ static inline int get_place_flag_by_hash(uint64_t hash)
     return 0;
 }
 
+static inline int should_try_interleave(size_t size)
+{
+    return size >= interleave_min_size;
+}
+
 /* Record allocation segment — O(1) average via hash table */
 void record_seg(unsigned long addr, size_t size, int place_flag)
 {
@@ -728,7 +734,7 @@ void *malloc(size_t sz)
         if (!libc_malloc) return NULL;
     }
 
-    if (sz > INTERLEAVE_THRESHOLD) {
+    if (sz > INTERLEAVE_THRESHOLD && should_try_interleave(sz)) {
         void *addr;
         size_t callchain_size = 0;
         void *callchain_strings[CALLCHAIN_SIZE];
@@ -771,7 +777,7 @@ void *calloc(size_t nmemb, size_t size)
 
     size_t total = nmemb * size;
 
-    if (total > INTERLEAVE_THRESHOLD) {
+    if (total > INTERLEAVE_THRESHOLD && should_try_interleave(total)) {
         size_t callchain_size = 0;
         void *callchain_strings[CALLCHAIN_SIZE];
 
@@ -835,7 +841,7 @@ void *memalign(size_t align, size_t sz)
         libc_memalign = (void * (*)(size_t, size_t))dlsym(RTLD_NEXT, "memalign");
         if (!libc_memalign) return NULL;
     }
-    if (sz > INTERLEAVE_THRESHOLD) {
+    if (sz > INTERLEAVE_THRESHOLD && should_try_interleave(sz)) {
         size_t callchain_size = 0;
         void *callchain_strings[CALLCHAIN_SIZE];
 
@@ -870,7 +876,7 @@ int posix_memalign(void **ptr, size_t align, size_t sz)
         libc_posix_memalign = (int (*)(void **, size_t, size_t))dlsym(RTLD_NEXT, "posix_memalign");
         if (!libc_posix_memalign) return ENOMEM;
     }
-    if (sz > INTERLEAVE_THRESHOLD) {
+    if (sz > INTERLEAVE_THRESHOLD && should_try_interleave(sz)) {
         size_t callchain_size = 0;
         void *callchain_strings[CALLCHAIN_SIZE];
 
@@ -947,6 +953,16 @@ int munmap(void *start, size_t length)
 }
 
 __attribute__((constructor)) void m_init(void) {
+    const char *interleave_min_size_env = getenv("CXL_MALLOC_INTERLEAVE_MIN_SIZE");
+    if (interleave_min_size_env) {
+        char *endptr = NULL;
+        unsigned long long parsed = strtoull(interleave_min_size_env, &endptr, 10);
+        if (endptr != interleave_min_size_env && *endptr == '\0' && parsed >= INTERLEAVE_THRESHOLD) {
+            interleave_min_size = (size_t)parsed;
+        }
+        CXL_LOG("CXL_MALLOC_INTERLEAVE_MIN_SIZE=%zu", interleave_min_size);
+    }
+
     /* Read madvise enable flag from environment variable */
     const char *enable_madvise_env = getenv("CXL_MALLOC_ENABLE_MADVISE");
     if (enable_madvise_env) {
@@ -1237,7 +1253,7 @@ void *aligned_alloc(size_t alignment, size_t size)
             return NULL;
         }
     }
-    if (size > INTERLEAVE_THRESHOLD) {
+    if (size > INTERLEAVE_THRESHOLD && should_try_interleave(size)) {
         size_t callchain_size = 0;
         void *callchain_strings[CALLCHAIN_SIZE];
         if (!_in_trace) {
