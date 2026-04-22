@@ -110,18 +110,6 @@ static int fixed_interleave_mode = 0;
 static int mbind2_available = 0;
 static pthread_once_t mbind2_probe_once = PTHREAD_ONCE_INIT;
 
-/*
- * Optional thread-policy pre-arm.
- *
- * Default is disabled because this allocator uses anonymous mmap without
- * MAP_POPULATE, so physical pages are typically faulted only after mbind2 has
- * already installed the VMA policy. In that common case, pre-arming the thread
- * policy adds two extra syscalls (set_mempolicy2 + restore) without changing
- * placement, and it hurts allocation-heavy multi-thread benchmarks.
- *
- * Keep it as an opt-in knob for experiments or future paths that may populate
- * pages before mbind2 completes.
- */
 static int prearm_thread_policy = 0;
 static __thread int tl_setpol2_ok = 1;  /* assume available until proven wrong */
 
@@ -307,23 +295,6 @@ static void probe_mbind2(void)
     }
 }
 
-/*
- * Fast path: mbind2 with inline weights — no global mutex, no sysfs write.
- *
- * Academic rationale:
- *   Old path serialises every interleave allocation on interleave_cfg_lock
- *   because the kernel reads weighted-interleave weights from global sysfs
- *   files at mbind() time. Two threads cannot update the sysfs weights
- *   concurrently without corrupting each other's VMA policy.
- *
- *   mbind2 passes il_weights inline inside mempolicy_args. The kernel copies
- *   them atomically into the new VMA's private mempolicy; no global sysfs
- *   state is involved. Consequently:
- *     1. The interleave_cfg_lock mutex is completely eliminated.
- *     2. Two file-writes (costly sysfs kernel path) reduce to zero.
- *     3. One syscall (mbind2) replaces three kernel operations.
- *     4. Threads scale to allocate different-ratio objects in parallel.
- */
 static int create_weighted_interleave_policy_mbind2(void *addr, size_t len, int place_flag)
 {
     unsigned long nodemask = (1UL << NUMA_LOCAL_NODE) | (1UL << NUMA_CXL_NODE);
@@ -354,7 +325,7 @@ static int create_weighted_interleave_policy_mbind2(void *addr, size_t len, int 
         return -1;
     }
 
-    if (enable_madvise && place_flag >= 3) {
+    if (enable_madvise && place_flag == 3) {
         if (madvise(addr, len, MADV_NOMIGRATE) != 0) {
             CXL_LOG("madvise MADV_NOMIGRATE failed: %s", strerror(errno));
             return -1;
