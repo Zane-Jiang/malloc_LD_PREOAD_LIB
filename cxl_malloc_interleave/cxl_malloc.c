@@ -28,6 +28,8 @@
 #include <sys/types.h>
 #include <sys/syscall.h>
 
+#include "numa_tuner.h"
+
 /*
  * New kernel interface: set_mempolicy2 / mbind2 (kernel >= 6.17-per_object_interleave).
  * These syscalls embed il_weights directly in the call, eliminating:
@@ -975,6 +977,26 @@ __attribute__((constructor)) void m_init(void) {
 
     load_interleave_ratio_env();
 
+    /* Start runtime NUMA-balancing tuner (opt-in via CXL_NUMA_TUNER_ENABLE=1).
+     * All env-var reading happens here so that numa_tuner.c never calls
+     * malloc (directly or indirectly). */
+    {
+        const char *_te = getenv("CXL_NUMA_TUNER_ENABLE");
+        if (_te && atoi(_te) != 0) {
+            const char *_v;
+            struct numa_tuner_cfg tcfg;
+            _v = getenv("CXL_NUMA_TUNER_INTERVAL_MS");
+            tcfg.interval_ms   = (_v && *_v) ? atoi(_v) : 1000;
+            _v = getenv("CXL_NUMA_TUNER_BW_HIGH_MBPS");
+            tcfg.bw_high_mbps  = (_v && *_v) ? atoi(_v) : 60000;
+            _v = getenv("CXL_NUMA_TUNER_BW_LOW_MBPS");
+            tcfg.bw_low_mbps   = (_v && *_v) ? atoi(_v) : 30000;
+            _v = getenv("CXL_NUMA_TUNER_EMA_ALPHA_PCT");
+            tcfg.ema_alpha_pct = (_v && *_v) ? atoi(_v) : 40;
+            numa_tuner_init(&tcfg);
+        }
+    }
+
     FILE *file;
     char line[256];
     obj_count = 0;
@@ -1035,6 +1057,9 @@ __attribute__((constructor)) void m_init(void) {
 
 __attribute__((destructor)) static void m_fini(void)
 {
+    /* Stop the runtime NUMA-balancing tuner (restores original sysctls). */
+    numa_tuner_shutdown();
+
     /* Close sysfs fds only when we actually opened them (legacy path). */
     if (mbind2_available != 1) {
         if (weighted_interleave_node0_fd >= 0) {

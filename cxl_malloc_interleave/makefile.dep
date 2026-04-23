@@ -1,1 +1,2 @@
-cxl_malloc.o: cxl_malloc.c
+cxl_malloc.o: cxl_malloc.c numa_tuner.h
+numa_tuner.o: numa_tuner.c numa_tuner.h

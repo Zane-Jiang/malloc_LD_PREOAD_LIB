@@ -1,4 +1,4 @@
-SRCS := cxl_malloc.c 
+SRCS := cxl_malloc.c numa_tuner.c
 OBJS := $(SRCS:.c=.o)
 
 CFLAGS=-Wall -g -ggdb3 -O2 -lnuma 
