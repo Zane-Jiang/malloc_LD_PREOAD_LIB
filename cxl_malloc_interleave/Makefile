@@ -1,7 +1,15 @@
 SRCS := cxl_malloc.c numa_tuner.c
 OBJS := $(SRCS:.c=.o)
 
-CFLAGS=-Wall -g -ggdb3 -O2 -lnuma 
+# FLAG5_MODE: direct  or cold (default)
+FLAG5_MODE ?= cold
+ifeq ($(FLAG5_MODE),cold)
+  FLAG5_DEF = -DCXL_FLAG5_USE_CXL_DIRECT=0
+else
+  FLAG5_DEF = -DCXL_FLAG5_USE_CXL_DIRECT=1
+endif
+
+CFLAGS=-Wall -g -ggdb3 -O2 -lnuma $(FLAG5_DEF)
 LIB_DIR = ../lib
 .PHONY: all clean
 all: makefile.dep libCXLMalloc.so

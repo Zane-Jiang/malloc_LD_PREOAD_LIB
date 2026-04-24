@@ -11,6 +11,7 @@
 #include <pthread.h>
 #include <assert.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 #include <stdlib.h>
 #include <dlfcn.h>
@@ -69,12 +70,12 @@ struct mempolicy_args {
 #define NUMA_LOCAL_NODE 0
 #define NUMA_CXL_NODE 1
 #define PAGE_SIZE 4096           /* Page size for interleaving */
-#define CXL_MALLOC_ENABLE_LOG 
-#ifdef CXL_MALLOC_ENABLE_LOG
-#define CXL_LOG(fmt, ...) printf("[cxl_malloc] " fmt "\n", ##__VA_ARGS__)
-#else
+
+#define CXL_ERR(fmt, ...) printf("[cxl_malloc ERR] " fmt "\n", ##__VA_ARGS__)
+/*  #define CXL_LOG(fmt, ...) printf("[cxl_malloc] " fmt "\n", ##__VA_ARGS__) */
+#define CXL_INFO(fmt, ...) printf("[cxl_malloc INFO] " fmt "\n", ##__VA_ARGS__)
 #define CXL_LOG(...) ((void)0)
-#endif
+
 
 
 #define FNV_PRIME (1099511628211ULL)
@@ -84,7 +85,7 @@ struct mempolicy_args {
 #define MAX_HASH_ENTRIES 1000
 static size_t interleave_min_size = 65536;  /* no-THP default: skip mmap/mbind2 for medium allocations */
 static uint64_t obj_hashes[MAX_HASH_ENTRIES];
-static int obj_place_flags[MAX_HASH_ENTRIES];          // 0: local, 1..4: interleave tiers, 5: CXL cold
+static int obj_place_flags[MAX_HASH_ENTRIES];          // 0: local, 1..4: interleave tiers, 5: CXL direct
 static long long obj_heate_cnts[MAX_HASH_ENTRIES];     // optional
 static double obj_bw_scores[MAX_HASH_ENTRIES];         // optional
 static int obj_count = 0;
@@ -98,6 +99,16 @@ static struct hash_entry sorted_entries[MAX_HASH_ENTRIES];
 static int sorted_count = 0;
 
 static int enable_madvise = 1;  /* Controls whether madvise is enabled (default: enabled) */
+
+#ifndef CXL_FLAG5_USE_CXL_DIRECT
+#define CXL_FLAG5_USE_CXL_DIRECT 1
+#endif
+
+/* Forward declarations for CXL-direct allocation (flag==5) */
+#if CXL_FLAG5_USE_CXL_DIRECT
+static void *cxl_direct_malloc(size_t size);
+static void *cxl_direct_aligned_alloc(size_t alignment, size_t size);
+#endif
 
 static int interleave_node0_weights[6] = {0, 5, 4, 3, 2, 0};
 static int interleave_node1_weights[6] = {0, 1, 1, 1, 1, 0};
@@ -235,7 +246,7 @@ static int prepare_interleave_weights_for_flag_locked(int place_flag)
         return 0;
     }
 
-    CXL_LOG("set weighted interleave failed for flag=%d (%d:%d), errno=%d", place_flag, w0, w1, errno);
+    CXL_ERR("set weighted interleave failed for flag=%d (%d:%d), errno=%d", place_flag, w0, w1, errno);
     return -1;
 }
 
@@ -256,7 +267,7 @@ static int create_weighted_interleave_policy_sysfs(void *addr, size_t len, int p
     }
 
     if (mbind(addr, len, MPOL_WEIGHTED_INTERLEAVE, &nodemask, maxnode, 0) != 0) {
-        CXL_LOG("mbind interleave failed: %s", strerror(errno));
+        CXL_ERR("mbind interleave failed: %s", strerror(errno));
         pthread_mutex_unlock(&interleave_cfg_lock);
         return -1;
     }
@@ -264,7 +275,7 @@ static int create_weighted_interleave_policy_sysfs(void *addr, size_t len, int p
 
     if (place_flag >= 3) {
         if (madvise(addr, len, MADV_NOMIGRATE) != 0) {
-            CXL_LOG("madvise MADV_NOMIGRATE failed: %s", strerror(errno));
+            CXL_ERR("madvise MADV_NOMIGRATE failed: %s", strerror(errno));
             return -1;
         }
     }
@@ -323,13 +334,13 @@ static int create_weighted_interleave_policy_mbind2(void *addr, size_t len, int 
                       &args, MEMPOLICY_ARGS_SIZE_VER0,
                       (unsigned int)0);
     if (rc != 0) {
-        CXL_LOG("mbind2 failed for flag=%d: %s", place_flag, strerror(errno));
+        CXL_ERR("mbind2 failed for flag=%d: %s", place_flag, strerror(errno));
         return -1;
     }
 
     if (enable_madvise && place_flag == 3) {
         if (madvise(addr, len, MADV_NOMIGRATE) != 0) {
-            CXL_LOG("madvise MADV_NOMIGRATE failed: %s", strerror(errno));
+            CXL_ERR("madvise MADV_NOMIGRATE failed: %s", strerror(errno));
             return -1;
         }
     }
@@ -602,7 +613,7 @@ void record_seg(unsigned long addr, size_t size, int place_flag)
         }
     }
     pthread_mutex_unlock(seg_lock);
-    CXL_LOG("Warning: seg shard %u full, cannot record segment", shard_id);
+    CXL_ERR("seg shard %u full, cannot record segment", shard_id);
 }
 
 /* Find entry by address — O(1) average. Caller must hold the shard lock. */
@@ -718,18 +729,22 @@ void *malloc(size_t sz)
         if (callchain_size >= 4) {
             uint64_t callstack_hash = compute_callstack_hash(callchain_strings, callchain_size, sz);
             int pf = get_place_flag_by_hash(callstack_hash);
-            if (pf == 5 || pf == 0) {
-                addr = libc_malloc(sz);
-                if(addr) {
-                    if (enable_madvise && pf == 5) madvise(addr, sz, MADV_COLD);
-                    return addr;
-                }
+            if (pf == 5) {
+#if CXL_FLAG5_USE_CXL_DIRECT
+                    addr = cxl_direct_malloc(sz);
+                    if (addr) return addr;
+                    CXL_ERR("cxl_direct_malloc failed for size %zu, falling back to libc_malloc", sz);
+#else
+                    addr = libc_malloc(sz);
+                    if (addr) {
+                        if (enable_madvise) madvise(addr, sz, MADV_COLD);
+                        return addr;
+                    }
+#endif
             } else if (pf >= 1 && pf <= 4) {
                 addr = interleave_malloc_with_flag(sz, pf);
-                if (addr) {
-                    return addr;
-                }
-                CXL_LOG("interleave_malloc failed for size %zu, falling back to libc_malloc", sz);
+                if (addr) return addr;
+                CXL_ERR("interleave_malloc failed for size %zu, falling back to libc_malloc", sz);
             }
         }
     }
@@ -760,18 +775,27 @@ void *calloc(size_t nmemb, size_t size)
         if (callchain_size >= 4) {
             uint64_t callstack_hash = compute_callstack_hash(callchain_strings, callchain_size, total);
             int pf = get_place_flag_by_hash(callstack_hash);
-            if (pf == 5 || pf == 0) {
-                void *addr = libc_calloc(nmemb, size);
-                if (addr) {
-                    if (enable_madvise && pf == 5) madvise(addr, total, MADV_COLD);
-                    return addr;
-                }
+            if (pf == 5) {
+#if CXL_FLAG5_USE_CXL_DIRECT
+                    void *addr = cxl_direct_malloc(total);
+                    if (addr) {
+                        memset(addr, 0, total);
+                        return addr;
+                    }
+                    CXL_ERR("cxl_direct_malloc (calloc) failed for size %zu, falling back to libc_calloc", total);
+#else
+                    void *addr = libc_calloc(nmemb, size);
+                    if (addr) {
+                        if (enable_madvise) madvise(addr, total, MADV_COLD);
+                        return addr;
+                    }
+#endif
             } else if (pf >= 1 && pf <= 4) {
                 void *addr = interleave_calloc_with_flag(nmemb, size, pf);
                 if (addr) {
                     return addr;
                 }
-                CXL_LOG("interleave_calloc failed for size %zu, falling back to libc_calloc", total);
+                CXL_ERR("interleave_calloc failed for size %zu, falling back to libc_calloc", total);
             }
         }
     }
@@ -801,6 +825,26 @@ void *realloc(void *ptr, size_t size)
     int pf = seg ? seg->place_flag : 0;
     pthread_mutex_unlock(seg_lock);
     
+#if CXL_FLAG5_USE_CXL_DIRECT
+    if (pf == 5) {
+        void *new_ptr = cxl_direct_malloc(size);
+        if (!new_ptr) return NULL;
+        unsigned int h2 = seg_hash((unsigned long)ptr);
+        pthread_mutex_t *sl2 = seg_lock_for_hash(h2);
+        pthread_mutex_lock(sl2);
+        struct seg_entry *s2 = find_seg((unsigned long)ptr);
+        size_t old_sz = s2 ? s2->size : 0;
+        pthread_mutex_unlock(sl2);
+        if (old_sz > 0) {
+            memcpy(new_ptr, ptr, old_sz < size ? old_sz : size);
+            check_seg((unsigned long)ptr, NULL);
+            numa_free(ptr, old_sz);
+        } else {
+            memcpy(new_ptr, ptr, size);
+        }
+        return new_ptr;
+    }
+#endif
     if (pf >= 1 && pf <= 4) {
         return interleave_realloc(ptr, size);
     }
@@ -824,18 +868,24 @@ void *memalign(size_t align, size_t sz)
         if (callchain_size >= 4) {
             uint64_t callstack_hash = compute_callstack_hash(callchain_strings, callchain_size, sz);
             int pf = get_place_flag_by_hash(callstack_hash);
-            if (pf == 5 || pf == 0) {
-                void *addr = libc_memalign(align, sz);
-                if (addr) {
-                    if (enable_madvise && pf == 5) madvise(addr, sz, MADV_COLD);
-                    return addr;
-                }
+            if (pf == 5) {
+#if CXL_FLAG5_USE_CXL_DIRECT
+                    void *addr = cxl_direct_aligned_alloc(align, sz);
+                    if (addr) return addr;
+                    CXL_ERR("cxl_direct_aligned_alloc (memalign) failed for size %zu, falling back to libc_memalign", sz);
+#else
+                    void *addr = libc_memalign(align, sz);
+                    if (addr) {
+                        if (enable_madvise) madvise(addr, sz, MADV_COLD);
+                        return addr;
+                    }
+#endif
             } else if (pf >= 1 && pf <= 4) {
                 void *addr = interleave_aligned_alloc_with_flag(align, sz, pf);
                 if (addr) {
                     return addr;
                 }
-                CXL_LOG("interleave_aligned_alloc failed for size %zu, falling back to libc_memalign", sz);
+                CXL_ERR("interleave_aligned_alloc failed for size %zu, falling back to libc_memalign", sz);
             }
         }
     }
@@ -859,18 +909,26 @@ int posix_memalign(void **ptr, size_t align, size_t sz)
         if (callchain_size >= 4) {
             uint64_t callstack_hash = compute_callstack_hash(callchain_strings, callchain_size, sz);
             int pf = get_place_flag_by_hash(callstack_hash);
-            if (pf == 5 || pf == 0) {
-                int ret = libc_posix_memalign(ptr, align, sz);
-                if (ret == 0) {
-                    if (enable_madvise && pf == 5) madvise(*ptr, sz, MADV_COLD);
-                    return 0;
-                }
+            if (pf == 5) {
+#if CXL_FLAG5_USE_CXL_DIRECT
+                    void *addr = cxl_direct_aligned_alloc(align, sz);
+                    if (addr) {
+                        *ptr = addr;
+                        return 0;
+                    }
+#else
+                    int ret = libc_posix_memalign(ptr, align, sz);
+                    if (ret == 0) {
+                        if (enable_madvise) madvise(*ptr, sz, MADV_COLD);
+                        return 0;
+                    }
+#endif
             } else if (pf >= 1 && pf <= 4) {
                 int ret = interleave_posix_memalign_with_flag(ptr, align, sz, pf);
                 if (ret == 0) {
                     return 0;
                 }
-                CXL_LOG("interleave_posix_memalign failed for size %zu, falling back to libc", sz);
+                CXL_ERR("interleave_posix_memalign failed for size %zu, falling back to libc", sz);
             }
         }
     }
@@ -888,6 +946,12 @@ void free(void *p)
     int place_flag = 0;
     size_t size_to_free = check_seg((unsigned long)p, &place_flag);
     
+#if CXL_FLAG5_USE_CXL_DIRECT
+    if (place_flag == 5) {
+        if (size_to_free > 0)
+            numa_free(p, size_to_free);
+    } else
+#endif
     if (place_flag >= 1 && place_flag <= 4) {
         ensure_mapping_funcs();
         if (likely(libc_munmap && size_to_free > 0)) {
@@ -942,6 +1006,12 @@ __attribute__((constructor)) void m_init(void) {
         enable_madvise = (atoi(enable_madvise_env) != 0) ? 1 : 0;
         CXL_LOG("CXL_MALLOC_ENABLE_MADVISE=%d", enable_madvise);
     }
+
+#if CXL_FLAG5_USE_CXL_DIRECT
+    CXL_INFO("FLAG5 mode: CXL direct (compile-time)");
+#else
+    CXL_INFO("FLAG5 mode: cold/madvise (compile-time)");
+#endif
     const char *prearm_thread_policy_env = getenv("CXL_MALLOC_PREARM_THREAD_POLICY");
     if (prearm_thread_policy_env) {
         prearm_thread_policy = (atoi(prearm_thread_policy_env) != 0) ? 1 : 0;
@@ -976,10 +1046,6 @@ __attribute__((constructor)) void m_init(void) {
     }
 
     load_interleave_ratio_env();
-
-    /* Start runtime NUMA-balancing tuner (opt-in via CXL_NUMA_TUNER_ENABLE=1).
-     * All env-var reading happens here so that numa_tuner.c never calls
-     * malloc (directly or indirectly). */
     {
         const char *_te = getenv("CXL_NUMA_TUNER_ENABLE");
         if (_te && atoi(_te) != 0) {
@@ -1129,6 +1195,55 @@ void *interleave_calloc_with_flag(size_t nmemb, size_t size, int place_flag)
     return ptr;
 }
 
+#if CXL_FLAG5_USE_CXL_DIRECT
+/*
+ * cxl_direct_malloc: allocate memory on the CXL NUMA node.
+ * Uses numa_alloc_onnode() for direct CXL placement.
+ */
+static void *cxl_direct_malloc(size_t size)
+{
+    size_t alloc_size = (size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    void *ptr = numa_alloc_onnode(alloc_size, NUMA_CXL_NODE);
+    if (!ptr) {
+        CXL_ERR("numa_alloc_onnode failed for size %zu: %s", size, strerror(errno));
+        return NULL;
+    }
+    record_seg((unsigned long)ptr, alloc_size, 5);
+    return ptr;
+}
+
+
+static void *cxl_direct_aligned_alloc(size_t alignment, size_t size)
+{
+    if (alignment < sizeof(void *) || (alignment & (alignment - 1)) != 0) {
+        errno = EINVAL;
+        return NULL;
+    }
+
+    size_t aligned_size = (size + alignment - 1) & ~(alignment - 1);
+    if (aligned_size < size) {
+        errno = ENOMEM;
+        return NULL;
+    }
+
+    /* Over-allocate so we can align within the region */
+    size_t alloc_size = aligned_size + alignment;
+    void *base = numa_alloc_onnode(alloc_size, NUMA_CXL_NODE);
+    if (!base) {
+        CXL_ERR("numa_alloc_onnode (aligned) failed for size %zu: %s", size, strerror(errno));
+        return NULL;
+    }
+
+    uintptr_t base_addr = (uintptr_t)base;
+    uintptr_t aligned_addr = (base_addr + alignment - 1) & ~(alignment - 1);
+    void *ptr = (void *)aligned_addr;
+
+    /* Record the *original* base so we can numa_free the whole region later */
+    record_seg((unsigned long)ptr, alloc_size, 5);
+    return ptr;
+}
+#endif /* CXL_FLAG5_USE_CXL_DIRECT */
+
 /*
  * interleave_aligned_alloc_with_flag: allocates aligned memory with interleave policy
  */
@@ -1258,18 +1373,24 @@ void *aligned_alloc(size_t alignment, size_t size)
         if (callchain_size >= 4) {
             uint64_t callstack_hash = compute_callstack_hash(callchain_strings, callchain_size, size);
             int pf = get_place_flag_by_hash(callstack_hash);
-            if (pf == 5 || pf == 0) {
-                void *addr = libc_aligned_alloc(alignment, size);
-                if (addr) {
-                    if (enable_madvise && pf == 5) madvise(addr, size, MADV_COLD);
-                    return addr;
-                }
+            if (pf == 5) {
+#if CXL_FLAG5_USE_CXL_DIRECT
+                    void *addr = cxl_direct_aligned_alloc(alignment, size);
+                    if (addr) return addr;
+                    CXL_ERR("cxl_direct_aligned_alloc (aligned_alloc) failed for size %zu, falling back to libc", size);
+#else
+                    void *addr = libc_aligned_alloc(alignment, size);
+                    if (addr) {
+                        if (enable_madvise) madvise(addr, size, MADV_COLD);
+                        return addr;
+                    }
+#endif
             } else if (pf >= 1 && pf <= 4) {
                 void *addr = interleave_aligned_alloc_with_flag(alignment, size, pf);
                 if (addr) {
                     return addr;
                 }
-                CXL_LOG("interleave_aligned_alloc failed, falling back to libc aligned_alloc");
+                CXL_ERR("interleave_aligned_alloc failed, falling back to libc aligned_alloc");
             }
         }
     }
